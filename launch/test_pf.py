@@ -9,6 +9,10 @@ import os
 
 def generate_launch_description():
     map_file = DeclareLaunchArgument('map_yaml')
+    print("hi")
+    print(map_file)
+    print(LaunchConfiguration('map_yaml'))
+    print("hi")
 
     lifecycle_nodes = ['map_server']
     use_sim_time = DeclareLaunchArgument('use_sim_time', default_value="true")

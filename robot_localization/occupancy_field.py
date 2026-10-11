@@ -26,6 +26,7 @@ class OccupancyField(object):
         node.get_logger().info("map received width: {0} height: {1}".format(self.map.info.width, self.map.info.height))
         # The coordinates of each grid cell in the map
         X = np.zeros((self.map.info.width*self.map.info.height, 2))
+        self.map_array = np.zeros((self.map.info.height, self.map.info.width))
 
         # while we're at it let's count the number of occupied cells
         total_occupied = 0
@@ -34,6 +35,7 @@ class OccupancyField(object):
             for j in range(self.map.info.height):
                 # occupancy grids are stored in row major order
                 ind = i + j*self.map.info.width
+                self.map_array[j, i] = self.map.data[ind]
                 if self.map.data[ind] > 0:
                     total_occupied += 1
                 X[curr, 0] = float(i)

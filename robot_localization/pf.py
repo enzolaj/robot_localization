@@ -3,6 +3,7 @@
 """ This is the starter code for the robot localization project """
 
 import rclpy
+from matplotlib import pyplot as plt
 from threading import Thread
 from rclpy.time import Time
 from rclpy.node import Node
@@ -19,6 +20,7 @@ from occupancy_field import OccupancyField
 from helper_functions import TFHelper
 from rclpy.qos import qos_profile_sensor_data
 from angle_helpers import quaternion_from_euler
+import random
 
 class Particle(object):
     """ Represents a hypothesis (particle) of the robot's pose consisting of x,y and theta (yaw)
@@ -77,7 +79,8 @@ class ParticleFilter(Node):
         self.scan_topic = "scan"        # the topic where we will get laser scans from 
 
         self.n_particles = 300          # the number of particles to use
-
+        self.sigma_liner = 0.5                 # in meters
+        self.sigma_angular = np.pi/2                # in radians
         self.d_thresh = 0.2             # the amount of linear movement before performing an update
         self.a_thresh = math.pi/6       # the amount of angular movement before performing an update
 
@@ -109,6 +112,18 @@ class ParticleFilter(Node):
         thread = Thread(target=self.loop_wrapper)
         thread.start()
         self.transform_update_timer = self.create_timer(0.05, self.pub_latest_transform)
+        x_bounds, y_bounds = self.occupancy_field.get_obstacle_bounding_box()
+        print("hi")
+        print(self.occupancy_field.map.info.width)
+        print(self.occupancy_field.map.info.height)
+        print(self.occupancy_field.map_array.shape)
+        print(self.occupancy_field.map.info.resolution)
+        #plt.imshow(self.occupancy_field.map_array, interpolation='nearest')
+        #plt.show()
+
+        test_pos = np.array([2, 2, 1])
+        #self.initialize_particle_cloud(test_pos)
+        self.initialize_particle_cloud()
 
     def pub_latest_transform(self):
         """ This function takes care of sending out the map to odom transform """
@@ -238,15 +253,55 @@ class ParticleFilter(Node):
         xy_theta = self.transform_helper.convert_pose_to_xy_and_theta(msg.pose.pose)
         self.initialize_particle_cloud(msg.header.stamp, xy_theta)
 
-    def initialize_particle_cloud(self, timestamp, xy_theta=None):
+    def initialize_particle_cloud(self, xy_theta=None):
         """ Initialize the particle cloud.
             Arguments
             xy_theta: a triple consisting of the mean x, y, and theta (yaw) to initialize the
                       particle cloud around.  If this input is omitted, the odometry will be used """
+        
+        """ if xy_theta is none that means that we awer given no point that is the best guess for our current particle(so probably the first guess)
+        and we should place particles randomly around all "empty" points on the map. 
+        if xy_theta is equal to something it will be an x-cord, y-cord, and a heading of our best guess at where our particle is and then we need to generate particles around that point
+        with normal/gausian destribution for the x, y, and heading"""
+        self.particle_cloud = np.zeros((self.n_particles, 3))
+        self.particle_map = self.occupancy_field.map_array
+        map_res = self.occupancy_field.map.info.resolution
+        map_width = self.occupancy_field.map.info.width
+        map_height = self.occupancy_field.map.info.height
+        print(self.occupancy_field.occupied[:, 0])
+        print(self.occupancy_field.occupied[:, 1])
         if xy_theta is None:
-            xy_theta = self.transform_helper.convert_pose_to_xy_and_theta(self.odom_pose)
-        self.particle_cloud = []
+            print("hi")
+            for i in range(0, self.n_particles-1):
+                x = random.randint(0, map_width - 1)
+                y = random.randint(0, map_height - 1)
+                t = (random.uniform(0, 2*np.pi))
+                while any(np.equal(self.occupancy_field.occupied,[x,y]).all(1)):
+                        x = random.randint(0, map_width - 1)
+                        y = random.randint(0, map_height - 1)
+                self.particle_cloud[i, :] = [x, y, t]
+                self.particle_map[int(self.particle_cloud[i, 1]), int(self.particle_cloud[i, 0])] = 200
+        else:
+            for i in range(0, self.n_particles-1):
+                #print(np.size(self.particle_cloud))
+                x = np.random.normal(xy_theta[0]/map_res, self.sigma_liner/map_res)
+                y = np.random.normal(xy_theta[1]/map_res, self.sigma_liner/map_res)
+                t = (np.random.normal(xy_theta[2], self.sigma_angular) % 2*np.pi)
+                while any(np.equal(self.occupancy_field.occupied,[x,y]).all(1)):
+                    x = np.random.normal(xy_theta[0]/map_res, self.sigma_liner/map_res)
+                    y = np.random.normal(xy_theta[1]/map_res, self.sigma_liner/map_res)
+                x, y, t = x, y, t if map_width - 1 > x > 0 and map_height - 1 > y > 0 else np.nan
+                self.particle_cloud[i, :] = [x, y, t]
+            self.particle_cloud = self.particle_cloud[~np.isnan(self.particle_cloud).any(axis=1)]
+            print(np.size(self.particle_cloud, 0))
+            for l in range(0, np.size(self.particle_cloud, 0) - 1):
+                #print(int(self.particle_cloud[l, 1]), int(self.particle_cloud[l, 0]))
+                self.particle_map[int(self.particle_cloud[l, 1]), int(self.particle_cloud[l, 0])] = 200
+            #xy_theta = self.transform_helper.convert_pose_to_xy_and_theta(self.odom_pose)
         # TODO create particles
+
+        plt.imshow(self.particle_map, interpolation='nearest')
+        plt.show()
 
         self.normalize_particles()
         self.update_robot_pose()
