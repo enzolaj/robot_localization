@@ -3,7 +3,6 @@
 """ This is the starter code for the robot localization project """
 
 import rclpy
-from matplotlib import pyplot as plt
 from threading import Thread
 from rclpy.time import Time
 from rclpy.node import Node
@@ -21,6 +20,7 @@ from helper_functions import TFHelper
 from rclpy.qos import qos_profile_sensor_data
 from angle_helpers import quaternion_from_euler
 import random
+from scipy.ndimage import gaussian_filter   # blurs the map into the likelihood field
 
 class Particle(object):
     """ Represents a hypothesis (particle) of the robot's pose consisting of x,y and theta (yaw)
@@ -36,7 +36,7 @@ class Particle(object):
             x: the x-coordinate of the hypothesis relative to the map frame
             y: the y-coordinate of the hypothesis relative ot the map frame
             theta: the yaw of KeyboardInterruptthe hypothesis relative to the map frame
-            w: the particle weight (the class does not ensure that particle weights are normalized """ 
+            w: the particle weight (the class does not ensure that particle weights are normalized """
         self.w = w
         self.theta = theta
         self.x = x
@@ -48,7 +48,8 @@ class Particle(object):
         return Pose(position=Point(x=self.x, y=self.y, z=0.0),
                     orientation=Quaternion(x=q[0], y=q[1], z=q[2], w=q[3]))
 
-    # TODO: define additional helper functions if needed
+    # the filter keeps all of its particles together in one numpy array, which makes the math easier.
+    # this class is used to turn a single row of that array into a Pose when publishing.
 
 class ParticleFilter(Node):
     """ The class that represents a Particle Filter ROS Node
@@ -70,21 +71,36 @@ class ParticleFilter(Node):
             current_odom_xy_theta: the pose of the robot in the odometry frame when the last filter update was performed.
                                    The pose is expressed as a list [x,y,theta] (where theta is the yaw)
             thread: this thread runs your main loop
+
+            particle_cloud is stored as an N x 3 numpy array, one row [x, y, theta] per particle, in the map frame
+            particle_weights: one weight per particle, in the same order as particle_cloud, adding up to 1
+            likelihood_field: a blurred copy of the map, indexed [x cell, y cell], that is high on and near walls
+            laser_offset: the (x, y) position of the laser on the robot, relative to its center
     """
     def __init__(self):
         super().__init__('pf')
         self.base_frame = "base_footprint"   # the frame of the robot base
         self.map_frame = "map"          # the name of the map coordinate frame
         self.odom_frame = "odom"        # the name of the odometry coordinate frame
-        self.scan_topic = "scan"        # the topic where we will get laser scans from 
+        self.scan_topic = "scan"        # the topic where we will get laser scans from
 
-        self.n_particles = 300          # the number of particles to use
-        self.sigma_liner = 0.5                 # in meters
-        self.sigma_angular = np.pi/2                # in radians
-        self.d_thresh = 0.2             # the amount of linear movement before performing an update
-        self.a_thresh = math.pi/6       # the amount of angular movement before performing an update
+        self.n_particles = self.declare_parameter("n_particles", 300).value          # the number of particles to use
 
-        # TODO: define additional constants if needed
+        self.d_thresh = self.declare_parameter("d_thresh", 0.2).value                # the amount of linear movement before performing an update
+        self.a_thresh = self.declare_parameter("a_thresh", math.pi/6).value          # the amount of angular movement before performing an update
+
+        # scoring laser scans
+        self.sigma_hit = self.declare_parameter("sigma_hit", 0.1).value              # [m] how far the blur spreads out from each wall
+        self.min_likelihood = self.declare_parameter("min_likelihood", 0.01).value   # every beam scores at least this, so one odd reading can't sink a good particle
+        self.beam_step = self.declare_parameter("beam_step", 2).value                # use every 2nd beam, which is plenty and twice as fast
+        # the starting cloud around a 2d pose estimate click
+        self.init_xy_sigma = self.declare_parameter("init_xy_sigma", 0.3).value      # [m] spread of the cloud around the click
+        self.init_theta_sigma = self.declare_parameter("init_theta_sigma", 0.3).value  # [rad] spread of the headings
+        # odometry noise, as a fraction of how far the robot drove or turned since the last update
+        self.odom_trans_noise = self.declare_parameter("odom_trans_noise", 0.1).value
+        self.odom_rot_noise = self.declare_parameter("odom_rot_noise", 0.1).value
+         # pose estimate
+        self.cluster_radius = self.declare_parameter("cluster_radius", 0.5).value    # [m] particles this close to the best one go into the pose estimate
 
         # pose_listener responds to selection of a new approximate robot location (for instance using rviz)
         self.create_subscription(PoseWithCovarianceStamped, 'initialpose', self.update_initial_pose, 10)
@@ -103,27 +119,20 @@ class ParticleFilter(Node):
         self.scan_to_process = None
         # your particle cloud will go here
         self.particle_cloud = []
+        self.particle_weights = []
 
         self.current_odom_xy_theta = []
         self.occupancy_field = OccupancyField(self)
         self.transform_helper = TFHelper(self)
 
+        # build the likelihood field once up front, so scoring a scan later only takes lookups
+        self.build_likelihood_field()
+
         # we are using a thread to work around single threaded execution bottleneck
-        thread = Thread(target=self.loop_wrapper)
+        # (daemon=True lets the program exit on ctrl+c, since this thread never finishes on its own)
+        thread = Thread(target=self.loop_wrapper, daemon=True)
         thread.start()
         self.transform_update_timer = self.create_timer(0.05, self.pub_latest_transform)
-        x_bounds, y_bounds = self.occupancy_field.get_obstacle_bounding_box()
-        print("hi")
-        print(self.occupancy_field.map.info.width)
-        print(self.occupancy_field.map.info.height)
-        print(self.occupancy_field.map_array.shape)
-        print(self.occupancy_field.map.info.resolution)
-        #plt.imshow(self.occupancy_field.map_array, interpolation='nearest')
-        #plt.show()
-
-        test_pos = np.array([2, 2, 1])
-        #self.initialize_particle_cloud(test_pos)
-        self.initialize_particle_cloud()
 
     def pub_latest_transform(self):
         """ This function takes care of sending out the map to odom transform """
@@ -144,8 +153,11 @@ class ParticleFilter(Node):
         """ This is the main run_loop of our particle filter.  It checks to see if
             any scans are ready and to be processed and will call several helper
             functions to complete the processing.
-            
+
             You do not need to modify this function, but it is helpful to understand it.
+
+            Before the particles are updated, the scan is trimmed down to the readings worth using,
+            and the laser's position on the robot is looked up so the beams can be placed correctly.
         """
         if self.scan_to_process is None:
             return
@@ -160,19 +172,33 @@ class ParticleFilter(Node):
                 # we will never get this transform, since it is before our oldest one
                 self.scan_to_process = None
             return
-        
+
         (r, theta) = self.transform_helper.convert_scan_to_polar_in_robot_frame(msg, self.base_frame)
-        print("r[0]={0}, theta[0]={1}".format(r[0], theta[0]))
+        # print("r[0]={0}, theta[0]={1}".format(r[0], theta[0]))
+
+        # keep every beam_step-th beam, and skip readings outside the range the laser reports as valid.
+        good_r = []
+        good_theta = []
+        for k in range(0, len(r), self.beam_step):
+            if msg.range_min <= r[k] < msg.range_max:
+                good_r.append(r[k])
+                good_theta.append(theta[k])
+        r = np.array(good_r)
+        theta = np.array(good_theta)
+
+        # where the laser sits on the robot 
+        self.laser_offset = self.get_laser_offset(msg.header.frame_id)
+
         # clear the current scan so that we can process the next one
         self.scan_to_process = None
 
         self.odom_pose = new_pose
         new_odom_xy_theta = self.transform_helper.convert_pose_to_xy_and_theta(self.odom_pose)
-        print("x: {0}, y: {1}, yaw: {2}".format(*new_odom_xy_theta))
+        # print("x: {0}, y: {1}, yaw: {2}".format(*new_odom_xy_theta))
 
         if not self.current_odom_xy_theta:
             self.current_odom_xy_theta = new_odom_xy_theta
-        elif not self.particle_cloud:
+        elif len(self.particle_cloud) == 0:
             # now that we have all of the necessary transforms we can update the particle cloud
             self.initialize_particle_cloud(msg.header.stamp)
         elif self.moved_far_enough_to_update(new_odom_xy_theta):
@@ -185,9 +211,12 @@ class ParticleFilter(Node):
         self.publish_particles(msg.header.stamp)
 
     def moved_far_enough_to_update(self, new_odom_xy_theta):
+        """ Returns True once the robot has driven more than d_thresh or turned more than a_thresh
+            since the last update. The turn goes through angle_diff, so swinging from 179 degrees to
+            -179 degrees counts as a 2 degree turn rather than 358. """
         return math.fabs(new_odom_xy_theta[0] - self.current_odom_xy_theta[0]) > self.d_thresh or \
                math.fabs(new_odom_xy_theta[1] - self.current_odom_xy_theta[1]) > self.d_thresh or \
-               math.fabs(new_odom_xy_theta[2] - self.current_odom_xy_theta[2]) > self.a_thresh
+               math.fabs(self.transform_helper.angle_diff(new_odom_xy_theta[2], self.current_odom_xy_theta[2])) > self.a_thresh
 
 
     def update_robot_pose(self):
@@ -195,13 +224,15 @@ class ParticleFilter(Node):
             There are two logical methods for this:
                 (1): compute the mean pose
                 (2): compute the most likely pose (i.e. the mode of the distribution)
+
+            This uses a blend of the two: it starts from the most likely particle and averages it
+            with the particles around it (see estimate_pose).
         """
         # first make sure that the particle weights are normalized
         self.normalize_particles()
 
-        # TODO: assign the latest pose into self.robot_pose as a geometry_msgs.Pose object
-        # just to get started we will fix the robot's pose to always be at the origin
-        self.robot_pose = Pose()
+        x, y, theta = self.estimate_pose()
+        self.robot_pose = Particle(x, y, theta).as_pose()
         if hasattr(self, 'odom_pose'):
             self.transform_helper.fix_map_to_odom_transform(self.robot_pose,
                                                             self.odom_pose)
@@ -213,6 +244,11 @@ class ParticleFilter(Node):
             The function computes the value delta which is a tuple (x,y,theta)
             that indicates the change in position and angle between the odometry
             when the particles were last updated and the current odometry.
+
+            Every particle is then moved by that same change. Since delta is measured in the odom
+            frame, it is first rewritten as how far the robot drove forward and how far it drifted
+            to its left. That motion is then applied along each particle's own heading, with a little
+            random noise so the particles don't all move in lockstep.
         """
         new_odom_xy_theta = self.transform_helper.convert_pose_to_xy_and_theta(self.odom_pose)
         # compute the change in x,y,theta since our last update
@@ -227,7 +263,33 @@ class ParticleFilter(Node):
             self.current_odom_xy_theta = new_odom_xy_theta
             return
 
-        # TODO: modify particles using delta
+        # modify particles using delta
+        # rotate delta by the robot's old heading to see the move from the robot's point of view:
+        # how far it went forward, and how far it went to its left.
+        old_heading = old_odom_xy_theta[2]
+        forward = math.cos(old_heading) * delta[0] + math.sin(old_heading) * delta[1]
+        left = -math.sin(old_heading) * delta[0] + math.cos(old_heading) * delta[1]
+        turn = self.transform_helper.angle_diff(new_odom_xy_theta[2], old_heading)
+
+        # odometry gets less reliable the further the robot goes, so the noise grows with the size of the move
+        distance = math.hypot(forward, left)
+        trans_noise = self.odom_trans_noise * distance
+        rot_noise = self.odom_rot_noise * abs(turn)
+
+        for i in range(len(self.particle_cloud)):
+            x, y, heading = self.particle_cloud[i]
+
+            # each particle gets its own slightly different version of the move
+            noisy_forward = forward + np.random.normal(0, trans_noise)
+            noisy_left = left + np.random.normal(0, trans_noise)
+            noisy_turn = turn + np.random.normal(0, rot_noise)
+
+            # forward for this particle means along its own heading, so rotate the move by that heading
+            x = x + noisy_forward * math.cos(heading) - noisy_left * math.sin(heading)
+            y = y + noisy_forward * math.sin(heading) + noisy_left * math.cos(heading)
+            heading = self.transform_helper.angle_normalize(heading + noisy_turn)
+
+            self.particle_cloud[i] = [x, y, heading]
 
     def resample_particles(self):
         """ Resample the particles according to the new particle weights.
@@ -242,10 +304,41 @@ class ParticleFilter(Node):
     def update_particles_with_laser(self, r, theta):
         """ Updates the particle weights in response to the scan data
             r: the distance readings to obstacles
-            theta: the angle relative to the robot frame for each corresponding reading 
+            theta: the angle relative to the robot frame for each corresponding reading
+
+            For each particle, the scan is laid on the map as if the robot were standing at that
+            particle, and every beam endpoint is looked up in the likelihood field to see how close it
+            lands to a wall. Particles whose scans line up with the walls get the highest weights.
         """
-        # TODO: implement this
-        pass
+        # where each beam ends, measured from the center of the robot. theta already accounts for the
+        # direction the laser faces; laser_offset accounts for it sitting a little off center.
+        beam_x = self.laser_offset[0] + r * np.cos(theta)
+        beam_y = self.laser_offset[1] + r * np.sin(theta)
+
+        n = len(self.particle_cloud)
+        log_scores = np.zeros(n)
+        for i in range(n):
+            x, y, heading = self.particle_cloud[i]
+
+            # move the beam endpoints to where they'd land if the robot were at this particle: rotate
+            # them by the particle's heading, then shift them by its position. end_x and end_y hold one value per beam.
+            end_x = x + beam_x * math.cos(heading) - beam_y * math.sin(heading)
+            end_y = y + beam_x * math.sin(heading) + beam_y * math.cos(heading)
+
+            # look up each endpoint in the likelihood field; endpoints off the map only get the minimum
+            ix, iy, on_map = self.world_to_cell(end_x, end_y)
+            beam_probs = np.full(len(r), self.min_likelihood)
+            beam_probs[on_map] += self.likelihood_field[ix[on_map], iy[on_map]]
+
+            # the likelihood of the whole scan is every beam's likelihood multiplied together. multiplying
+            # hundreds of small numbers rounds down to 0, so we add their logs instead, which ranks the
+            # particles the same way.
+            log_scores[i] = np.sum(np.log(beam_probs))
+
+        # this was something i saw: subtracting the best score first gives the best particle
+        # a weight of exactly 1 before normalizing, so nothing rounds to 0 by accident.
+        self.particle_weights = np.exp(log_scores - np.max(log_scores))
+        self.normalize_particles()
 
     def update_initial_pose(self, msg):
         """ Callback function to handle re-initializing the particle filter based on a pose estimate.
@@ -253,78 +346,180 @@ class ParticleFilter(Node):
         xy_theta = self.transform_helper.convert_pose_to_xy_and_theta(msg.pose.pose)
         self.initialize_particle_cloud(msg.header.stamp, xy_theta)
 
-    def initialize_particle_cloud(self, xy_theta=None):
+    def initialize_particle_cloud(self, timestamp, xy_theta=None):
         """ Initialize the particle cloud.
             Arguments
             xy_theta: a triple consisting of the mean x, y, and theta (yaw) to initialize the
-                      particle cloud around.  If this input is omitted, the odometry will be used """
-        
-        """ if xy_theta is none that means that we awer given no point that is the best guess for our current particle(so probably the first guess)
-        and we should place particles randomly around all "empty" points on the map. 
-        if xy_theta is equal to something it will be an x-cord, y-cord, and a heading of our best guess at where our particle is and then we need to generate particles around that point
-        with normal/gausian destribution for the x, y, and heading"""
-        self.particle_cloud = np.zeros((self.n_particles, 3))
-        self.particle_map = self.occupancy_field.map_array
-        map_res = self.occupancy_field.map.info.resolution
-        map_width = self.occupancy_field.map.info.width
-        map_height = self.occupancy_field.map.info.height
-        print(self.occupancy_field.occupied[:, 0])
-        print(self.occupancy_field.occupied[:, 1])
-        if xy_theta is None:
-            print("hi")
-            for i in range(0, self.n_particles-1):
-                x = random.randint(0, map_width - 1)
-                y = random.randint(0, map_height - 1)
-                t = (random.uniform(0, 2*np.pi))
-                while any(np.equal(self.occupancy_field.occupied,[x,y]).all(1)):
-                        x = random.randint(0, map_width - 1)
-                        y = random.randint(0, map_height - 1)
-                self.particle_cloud[i, :] = [x, y, t]
-                self.particle_map[int(self.particle_cloud[i, 1]), int(self.particle_cloud[i, 0])] = 200
-        else:
-            for i in range(0, self.n_particles-1):
-                #print(np.size(self.particle_cloud))
-                x = np.random.normal(xy_theta[0]/map_res, self.sigma_liner/map_res)
-                y = np.random.normal(xy_theta[1]/map_res, self.sigma_liner/map_res)
-                t = (np.random.normal(xy_theta[2], self.sigma_angular) % 2*np.pi)
-                while any(np.equal(self.occupancy_field.occupied,[x,y]).all(1)):
-                    x = np.random.normal(xy_theta[0]/map_res, self.sigma_liner/map_res)
-                    y = np.random.normal(xy_theta[1]/map_res, self.sigma_liner/map_res)
-                x, y, t = x, y, t if map_width - 1 > x > 0 and map_height - 1 > y > 0 else np.nan
-                self.particle_cloud[i, :] = [x, y, t]
-            self.particle_cloud = self.particle_cloud[~np.isnan(self.particle_cloud).any(axis=1)]
-            print(np.size(self.particle_cloud, 0))
-            for l in range(0, np.size(self.particle_cloud, 0) - 1):
-                #print(int(self.particle_cloud[l, 1]), int(self.particle_cloud[l, 0]))
-                self.particle_map[int(self.particle_cloud[l, 1]), int(self.particle_cloud[l, 0])] = 200
-            #xy_theta = self.transform_helper.convert_pose_to_xy_and_theta(self.odom_pose)
-        # TODO create particles
+                      particle cloud around.  If this input is omitted, the odometry will be used
 
-        plt.imshow(self.particle_map, interpolation='nearest')
-        plt.show()
+            Without a guess, which is the case at startup, the particles are scattered across every open
+            cell of the map with random headings, since the robot could be anywhere. With a guess, such as a
+            click from 2D Pose Estimate, the particles are drawn from a normal distribution around that x, y,
+            and heading. A particle that lands in a wall or off the map is drawn again, so the cloud always
+            has n_particles, all in open space.
+        """
+        # if xy_theta is None:
+        #     xy_theta = self.transform_helper.convert_pose_to_xy_and_theta(self.odom_pose)
+        self.particle_cloud = np.zeros((self.n_particles, 3))
+        # create particles
+        if xy_theta is None:
+            for i in range(self.n_particles):
+                self.particle_cloud[i, :] = self.random_particle()
+        else:
+            for i in range(self.n_particles):
+                x = np.random.normal(xy_theta[0], self.init_xy_sigma)
+                y = np.random.normal(xy_theta[1], self.init_xy_sigma)
+                # draw again if this spot is a wall or off the map. the cap on tries keeps a click far
+                # outside the map from looping forever.
+                tries = 0
+                while not self.is_free(x, y) and tries < 100:
+                    x = np.random.normal(xy_theta[0], self.init_xy_sigma)
+                    y = np.random.normal(xy_theta[1], self.init_xy_sigma)
+                    tries += 1
+                t = self.transform_helper.angle_normalize(np.random.normal(xy_theta[2], self.init_theta_sigma))
+                self.particle_cloud[i, :] = [x, y, t]
+
+        # visualization code, the copy was added so as to not modify original map
+        # particle_map = self.occupancy_field.map_array.copy()
+        # for i in range(self.n_particles):
+        #     ix, iy, on_map = self.world_to_cell(self.particle_cloud[i, 0], self.particle_cloud[i, 1])
+        #     if on_map:
+        #         particle_map[iy, ix] = 200
+        # plt.imshow(particle_map, interpolation='nearest')
+        # plt.show()
+
+        self.particle_weights = np.ones(self.n_particles)
+
+        # measure the next move from where the robot is now, so anything it did before this reset
+        # isn't applied to the new cloud.
+        if hasattr(self, 'odom_pose'):
+            self.current_odom_xy_theta = self.transform_helper.convert_pose_to_xy_and_theta(self.odom_pose)
 
         self.normalize_particles()
         self.update_robot_pose()
 
     def normalize_particles(self):
-        """ Make sure the particle weights define a valid distribution (i.e. sum to 1.0) """
-        # TODO: implement this
-        pass
+        """ Make sure the particle weights define a valid distribution (i.e. sum to 1.0)
+
+            Each weight is divided by the total. If the total is zero or not a real number, which happens
+            when every particle scores 0, the weights are reset to all equal instead. """
+        total = np.sum(self.particle_weights)
+        if total > 0 and np.isfinite(total):
+            self.particle_weights = self.particle_weights / total
+        else:
+            self.particle_weights = np.ones(len(self.particle_cloud)) / len(self.particle_cloud)
 
     def publish_particles(self, timestamp):
+        """ Publishes the particle cloud so rviz can show it. Each row of particle_cloud is wrapped in a
+            Particle so its as_pose() can build the message. """
         msg = ParticleCloud()
         msg.header.frame_id = self.map_frame
         msg.header.stamp = timestamp
-        for p in self.particle_cloud:
+        for i in range(len(self.particle_cloud)):
+            x, y, theta = self.particle_cloud[i]
+            p = Particle(float(x), float(y), float(theta), float(self.particle_weights[i]))
             msg.particles.append(Nav2Particle(pose=p.as_pose(), weight=p.w))
         self.particle_pub.publish(msg)
 
     def scan_received(self, msg):
         self.last_scan_timestamp = msg.header.stamp
         # we throw away scans until we are done processing the previous scan
-        # self.scan_to_process is set to None in the run_loop 
+        # self.scan_to_process is set to None in the run_loop
         if self.scan_to_process is None:
             self.scan_to_process = msg
+
+    # helper functions
+    def build_likelihood_field(self):
+        """ Builds the likelihood field - a grid the same size as the map, where each cell is how likely
+            a laser beam is to end there, where walls are marked 1 and everything else 0, and the result is
+            blurred for more information for our algorithm. """
+        m = self.occupancy_field.map
+        self.map_resolution = m.info.resolution
+        # all of our maps have a rotation of 0 (the third origin value in the yaml), so only x and y are needed
+        self.map_origin_x = m.info.origin.position.x
+        self.map_origin_y = m.info.origin.position.y
+
+        # the map arrives as one long list: 100 for a wall, 0 for free space, -1 for unknown. it starts at
+        # the map origin in the bottom left corner and goes row by row. reshaping gives rows of y and
+        # columns of x, and transposing lets us index it as grid[x cell, y cell].
+        grid = np.array(m.data).reshape(m.info.height, m.info.width).T
+
+        # gaussian_filter replaces each cell with a weighted average of the cells around it, where closer
+        # cells count more. its sigma is measured in cells, so sigma_hit gets converted from meters.
+        # mode="constant" treats everything outside the map as empty.
+        walls = (grid > 0).astype(float)
+        blurred = gaussian_filter(walls, self.sigma_hit / self.map_resolution, mode="constant")
+        # scale so the highest value is 1
+        self.likelihood_field = blurred / np.max(blurred)
+
+    def world_to_cell(self, x, y):
+        """ Converts map coordinates in meters into grid cell indices. on_map is True for points that fall
+            inside the map. Works on single values or whole numpy arrays. """
+        ix = np.floor((x - self.map_origin_x) / self.map_resolution).astype(int)
+        iy = np.floor((y - self.map_origin_y) / self.map_resolution).astype(int)
+        width, height = self.likelihood_field.shape
+        on_map = (ix >= 0) & (ix < width) & (iy >= 0) & (iy < height)
+        return ix, iy, on_map
+
+    def get_laser_offset(self, laser_frame):
+        """ Looks up where the laser is mounted relative to the center of the robot and returns its (x, y).
+            The angles from convert_scan_to_polar_in_robot_frame already account for the direction the
+            laser faces, but not for where it sits on the robot. """
+        transform = self.transform_helper.tf_buffer.lookup_transform(self.base_frame, laser_frame, Time())
+        return (transform.transform.translation.x, transform.transform.translation.y)
+
+    def random_particle(self):
+        """ Returns one particle [x, y, theta] at a random open spot on the map, facing a random direction.
+            Random cells are picked until one is free, then a random point inside that cell is converted
+            to meters. """
+        map_width = self.occupancy_field.map.info.width
+        map_height = self.occupancy_field.map.info.height
+        x = random.randint(0, map_width - 1)
+        y = random.randint(0, map_height - 1)
+        # map_array holds the raw map values with rows as y and columns as x. only 0 is free space,
+        # so this skips both walls (100) and unknown areas outside the walls (-1).
+        while self.occupancy_field.map_array[y, x] != 0:
+            x = random.randint(0, map_width - 1)
+            y = random.randint(0, map_height - 1)
+        t = random.uniform(-math.pi, math.pi)
+        # turn the cell into meters, adding random.random() to land somewhere inside the cell rather than on its corner
+        x_meters = self.map_origin_x + (x + random.random()) * self.map_resolution
+        y_meters = self.map_origin_y + (y + random.random()) * self.map_resolution
+        return [x_meters, y_meters, t]
+
+    def is_free(self, x, y):
+        """ True if the point (x, y), in meters, is on the map and in free space """
+        ix, iy, on_map = self.world_to_cell(x, y)
+        return bool(on_map) and self.occupancy_field.map_array[iy, ix] == 0
+
+    def estimate_pose(self):
+        """ Returns the best guess of the robot's pose as (x, y, theta). It finds the highest weighted
+            particle and takes the weighted average of every particle within cluster_radius of it.
+            Averaging the entire cloud would fail if it split into two groups, because the average would
+            land in the empty space between them. Using only the single best particle would make the
+            estimate jump around from one update to the next. """
+        best = np.argmax(self.particle_weights)
+        best_x, best_y, _ = self.particle_cloud[best]
+
+        total_weight = 0.0
+        sum_x = 0.0
+        sum_y = 0.0
+        sum_cos = 0.0
+        sum_sin = 0.0
+        for i in range(len(self.particle_cloud)):
+            x, y, theta = self.particle_cloud[i]
+            w = self.particle_weights[i]
+            if math.hypot(x - best_x, y - best_y) < self.cluster_radius:
+                total_weight += w
+                sum_x += w * x
+                sum_y += w * y
+                # headings can't be averaged as plain numbers: 179 and -179 degrees would average to 0,
+                # the opposite direction. averaging them as arrows (cos, sin) and taking the direction of
+                # the result gives 180, which is right.
+                sum_cos += w * math.cos(theta)
+                sum_sin += w * math.sin(theta)
+
+        return (sum_x / total_weight, sum_y / total_weight, math.atan2(sum_sin, sum_cos))
 
 def main(args=None):
     rclpy.init()
