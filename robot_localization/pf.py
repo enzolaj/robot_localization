@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """ This is the starter code for the robot localization project """
-
+from matplotlib import pyplot as plt
 import rclpy
 from threading import Thread
 from rclpy.time import Time
@@ -137,6 +137,15 @@ class ParticleFilter(Node):
         thread = Thread(target=self.loop_wrapper, daemon=True)
         thread.start()
         self.transform_update_timer = self.create_timer(0.05, self.pub_latest_transform)
+
+        # resample test code
+        self.initialize_particle_cloud()
+
+        self.particle_weights = np.zeros([self.n_particles, 1])
+        self.particle_weights[10:13, 0] = 0.1
+        self.particle_weights[0, 0] = 0.7
+
+        self.resample_particles()
 
 
     def pub_latest_transform(self):
@@ -308,32 +317,30 @@ class ParticleFilter(Node):
         normal_particle_cloud = np.zeros([normal_particle_count, 3])
 
 
-        particle_weights_sort = np.array(self.particle_weights).argsort()
-        print(np.array(self.particle_weights))
-        sorted_weights = np.array(self.particle_weights)[particle_weights_sort[::-1]]
+        particle_weights_sort = np.concatenate(self.particle_weights).argsort()
+        sorted_weights = self.particle_weights[particle_weights_sort[::-1]]
         sorted_particles = self.particle_cloud[particle_weights_sort[::-1]]
-
         total_normal_weights = normal_particle_count/self.n_particles
 
         weights_to_use = 0
         #  find how many of the weights it takes to make the number of normaly
         #  distributed particles
 
-        while sum(sorted_weights[:sorted_weights.index(weights_to_use)]) > total_normal_weights:
+        while np.sum(sorted_weights[:weights_to_use]) < total_normal_weights:
             weights_to_use += 1
+        #print(weights_to_use)
 
-        normal_weights = sorted_weights[:(weights_to_use-1)]
+        normal_weights = sorted_weights[:(weights_to_use), :]
+        print(normal_weights)
         count = 0
         for j in range(weights_to_use):
-            for k in range(normal_weights[j] * normal_particle_count):
+            for k in range(int(normal_weights[j] * normal_particle_count)):
                 normal_particle_cloud[count, :] = self.normal_particle(sorted_particles[j, :])
                 count += 1
 
 
-        #while normal_particle_cloud[-1 :] == np.array([0, 0, 0]):
-            #for j in range(math.floor)
-
-
+        self.particle_cloud = np.concatenate((random_particle_cloud, normal_particle_cloud), axis=0)
+        print(self.particle_cloud)
 
 
         """ Resample the particles according to the new particle weights.
@@ -390,17 +397,13 @@ class ParticleFilter(Node):
         xy_theta = self.transform_helper.convert_pose_to_xy_and_theta(msg.pose.pose)
         self.initialize_particle_cloud(msg.header.stamp, xy_theta)
 
-    def initialize_particle_cloud(self, timestamp, xy_theta=None):
+    def initialize_particle_cloud(self, timestamp=0, xy_theta=None):
         """ Initialize the particle cloud.
             Arguments
             xy_theta: a triple consisting of the mean x, y, and theta (yaw) to initialize the
                       particle cloud around.  If this input is omitted, the odometry will be used
 
-            Without a guess, which is the case at startup, the particles are scattered across every open
-            cell of the map with random headings, since the robot could be anywhere. With a guess, such as a
-            click from 2D Pose Estimate, the particles are drawn from a normal distribution around that x, y,
-            and heading. A particle that lands in a wall or off the map is drawn again, so the cloud always
-            has n_particles, all in open space.
+            creaates n_particles number fully randomly placed particles 
         """
         # if xy_theta is None:
         #     xy_theta = self.transform_helper.convert_pose_to_xy_and_theta(self.odom_pose)
