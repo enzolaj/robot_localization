@@ -84,10 +84,14 @@ class ParticleFilter(Node):
         self.odom_frame = "odom"        # the name of the odometry coordinate frame
         self.scan_topic = "scan"        # the topic where we will get laser scans from
 
+        #initilaze particle field
         self.n_particles = self.declare_parameter("n_particles", 300).value          # the number of particles to use
 
+        #resample particle field
         self.d_thresh = self.declare_parameter("d_thresh", 0.2).value                # the amount of linear movement before performing an update
-        self.a_thresh = self.declare_parameter("a_thresh", math.pi/6).value          # the amount of angular movement before performing an update
+        self.a_thresh = self.declare_parameter("a_thresh", math.pi/6).value        # the amount of angular movement before performing an update
+
+        self.random_resample = self.declare_parameter("random_resample", 0.1).value # porportion of particles that are randomly placed to prevent particle degenecary
 
         # scoring laser scans
         self.sigma_hit = self.declare_parameter("sigma_hit", 0.1).value              # [m] how far the blur spreads out from each wall
@@ -133,6 +137,7 @@ class ParticleFilter(Node):
         thread = Thread(target=self.loop_wrapper, daemon=True)
         thread.start()
         self.transform_update_timer = self.create_timer(0.05, self.pub_latest_transform)
+
 
     def pub_latest_transform(self):
         """ This function takes care of sending out the map to odom transform """
@@ -292,6 +297,45 @@ class ParticleFilter(Node):
             self.particle_cloud[i] = [x, y, heading]
 
     def resample_particles(self):
+
+        random_particle_count = math.floor(self.n_particles * self.random_resample)
+        random_particle_cloud = np.zeros([random_particle_count, 3])
+
+        for i in range(random_particle_count):
+            random_particle_cloud[i, :] = self.random_particle()
+
+        normal_particle_count = self.n_particles - random_particle_count
+        normal_particle_cloud = np.zeros([normal_particle_count, 3])
+
+
+        particle_weights_sort = np.array(self.particle_weights).argsort()
+        print(np.array(self.particle_weights))
+        sorted_weights = np.array(self.particle_weights)[particle_weights_sort[::-1]]
+        sorted_particles = self.particle_cloud[particle_weights_sort[::-1]]
+
+        total_normal_weights = normal_particle_count/self.n_particles
+
+        weights_to_use = 0
+        #  find how many of the weights it takes to make the number of normaly
+        #  distributed particles
+
+        while sum(sorted_weights[:sorted_weights.index(weights_to_use)]) > total_normal_weights:
+            weights_to_use += 1
+
+        normal_weights = sorted_weights[:(weights_to_use-1)]
+        count = 0
+        for j in range(weights_to_use):
+            for k in range(normal_weights[j] * normal_particle_count):
+                normal_particle_cloud[count, :] = self.normal_particle(sorted_particles[j, :])
+                count += 1
+
+
+        #while normal_particle_cloud[-1 :] == np.array([0, 0, 0]):
+            #for j in range(math.floor)
+
+
+
+
         """ Resample the particles according to the new particle weights.
             The weights stored with each particle should define the probability that a particular
             particle is selected in the resampling step.  You may want to make use of the given helper
@@ -365,19 +409,7 @@ class ParticleFilter(Node):
         if xy_theta is None:
             for i in range(self.n_particles):
                 self.particle_cloud[i, :] = self.random_particle()
-        else:
-            for i in range(self.n_particles):
-                x = np.random.normal(xy_theta[0], self.init_xy_sigma)
-                y = np.random.normal(xy_theta[1], self.init_xy_sigma)
-                # draw again if this spot is a wall or off the map. the cap on tries keeps a click far
-                # outside the map from looping forever.
-                tries = 0
-                while not self.is_free(x, y) and tries < 100:
-                    x = np.random.normal(xy_theta[0], self.init_xy_sigma)
-                    y = np.random.normal(xy_theta[1], self.init_xy_sigma)
-                    tries += 1
-                t = self.transform_helper.angle_normalize(np.random.normal(xy_theta[2], self.init_theta_sigma))
-                self.particle_cloud[i, :] = [x, y, t]
+        
 
         # visualization code, the copy was added so as to not modify original map
         # particle_map = self.occupancy_field.map_array.copy()
@@ -397,6 +429,22 @@ class ParticleFilter(Node):
 
         self.normalize_particles()
         self.update_robot_pose()
+
+    def normal_particle(self, xy_theta):
+
+        x = np.random.normal(xy_theta[0], self.init_xy_sigma)
+        y = np.random.normal(xy_theta[1], self.init_xy_sigma)
+        # draw again if this spot is a wall or off the map. the cap on tries keeps a click far
+        # outside the map from looping forever.
+        tries = 0
+        while not self.is_free(x, y) and tries < 100:
+            x = np.random.normal(xy_theta[0], self.init_xy_sigma)
+            y = np.random.normal(xy_theta[1], self.init_xy_sigma)
+            tries += 1
+        t = self.transform_helper.angle_normalize(np.random.normal(xy_theta[2], self.init_theta_sigma))
+        return [x, y, t]
+
+
 
     def normalize_particles(self):
         """ Make sure the particle weights define a valid distribution (i.e. sum to 1.0)
@@ -477,7 +525,7 @@ class ParticleFilter(Node):
         x = random.randint(0, map_width - 1)
         y = random.randint(0, map_height - 1)
         # map_array holds the raw map values with rows as y and columns as x. only 0 is free space,
-        # so this skips both walls (100) and unknown areas outside the walls (-1).
+        # so this skips both walls (1/home/liam/ros2_ws/src/robot_localization/maps/gauntlet.yaml00) and unknown areas outside the walls (-1).
         while self.occupancy_field.map_array[y, x] != 0:
             x = random.randint(0, map_width - 1)
             y = random.randint(0, map_height - 1)
