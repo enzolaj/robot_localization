@@ -139,13 +139,13 @@ class ParticleFilter(Node):
         self.transform_update_timer = self.create_timer(0.05, self.pub_latest_transform)
 
         # resample test code
-        self.initialize_particle_cloud()
+        #self.initialize_particle_cloud()
 
-        self.particle_weights = np.zeros([self.n_particles, 1])
-        self.particle_weights[10:13, 0] = 0.1
-        self.particle_weights[0, 0] = 0.7
+        #self.particle_weights = np.zeros([self.n_particles, 1])
+        #self.particle_weights[10:13, 0] = 0.1
+        #self.particle_weights[0, 0] = 0.7
 
-        self.resample_particles()
+        #self.resample_particles()
 
 
     def pub_latest_transform(self):
@@ -340,7 +340,7 @@ class ParticleFilter(Node):
 
 
         self.particle_cloud = np.concatenate((random_particle_cloud, normal_particle_cloud), axis=0)
-        print(self.particle_cloud)
+        #print(self.particle_cloud)
 
 
         """ Resample the particles according to the new particle weights.
