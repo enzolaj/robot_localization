@@ -85,18 +85,22 @@ class ParticleFilter(Node):
         self.scan_topic = "scan"        # the topic where we will get laser scans from
 
         #initilaze particle field
-        self.n_particles = self.declare_parameter("n_particles", 300).value          # the number of particles to use
+        self.n_particles = self.declare_parameter("n_particles", 3000).value          # the number of particles to use
 
         #resample particle field
-        self.d_thresh = self.declare_parameter("d_thresh", 0.2).value                # the amount of linear movement before performing an update
-        self.a_thresh = self.declare_parameter("a_thresh", math.pi/6).value        # the amount of angular movement before performing an update
+        self.d_thresh = self.declare_parameter("d_thresh", 0.05).value                # the amount of linear movement before performing an update
+        self.a_thresh = self.declare_parameter("a_thresh", math.pi/24).value        # the amount of angular movement before performing an update
 
-        self.random_resample = self.declare_parameter("random_resample", 0.1).value # porportion of particles that are randomly placed to prevent particle degenecary
+        self.random_resample = self.declare_parameter("random_resample", 0.15).value # porportion of particles that are randomly placed to prevent particle degenecary
+        # how far each resampled copy is spread from the particle it was copied from. much smaller than the
+        # init spread, since these copies come from particles that already scored well
+        self.resample_xy_sigma = self.declare_parameter("resample_xy_sigma", 0.1).value       # [m]
+        self.resample_theta_sigma = self.declare_parameter("resample_theta_sigma", 0.1).value # [rad]
 
         # scoring laser scans
-        self.sigma_hit = self.declare_parameter("sigma_hit", 0.1).value              # [m] how far the blur spreads out from each wall
+        self.sigma_hit = self.declare_parameter("sigma_hit", 0.3).value              # [m] how far the blur spreads out from each wall
         self.min_likelihood = self.declare_parameter("min_likelihood", 0.01).value   # every beam scores at least this, so one odd reading can't sink a good particle
-        self.beam_step = self.declare_parameter("beam_step", 2).value                # use every 2nd beam, which is plenty and twice as fast
+        self.beam_step = self.declare_parameter("beam_step", 3).value                # use every 2nd beam, which is plenty and twice as fast
         # the starting cloud around a 2d pose estimate click
         self.init_xy_sigma = self.declare_parameter("init_xy_sigma", 0.3).value      # [m] spread of the cloud around the click
         self.init_theta_sigma = self.declare_parameter("init_theta_sigma", 0.3).value  # [rad] spread of the headings
@@ -138,14 +142,14 @@ class ParticleFilter(Node):
         thread.start()
         self.transform_update_timer = self.create_timer(0.05, self.pub_latest_transform)
 
-        # resample test code
-        #self.initialize_particle_cloud()
+       
+        # self.initialize_particle_cloud()
 
-        #self.particle_weights = np.zeros([self.n_particles, 1])
-        #self.particle_weights[10:13, 0] = 0.1
-        #self.particle_weights[0, 0] = 0.7
+        # self.particle_weights = np.zeros([self.n_particles, 1])
+        # self.particle_weights[10:13, 0] = 0.1
+        # self.particle_weights[0, 0] = 0.7
 
-        #self.resample_particles()
+        # self.resample_particles()
 
 
     def pub_latest_transform(self):
@@ -223,6 +227,8 @@ class ParticleFilter(Node):
             self.resample_particles()               # resample particles to focus on areas of high density
         # publish particles (so things like rviz can see them)
         self.publish_particles(msg.header.stamp)
+        lag = (self.get_clock().now() - Time.from_msg(msg.header.stamp)).nanoseconds / 1e9
+        print(f"lag {lag:.2f} s")
 
     def moved_far_enough_to_update(self, new_odom_xy_theta):
         """ Returns True once the robot has driven more than d_thresh or turned more than a_thresh
@@ -306,6 +312,13 @@ class ParticleFilter(Node):
             self.particle_cloud[i] = [x, y, heading]
 
     def resample_particles(self):
+        """ Resample the particles according to the new particle weights.
+            The weights stored with each particle should define the probability that a particular
+            particle is selected in the resampling step.  You may want to make use of the given helper
+            function draw_random_sample in helper_functions.py.
+        """
+        # make sure the distribution is normalized
+        self.normalize_particles()
 
         random_particle_count = math.floor(self.n_particles * self.random_resample)
         random_particle_cloud = np.zeros([random_particle_count, 3])
@@ -317,40 +330,44 @@ class ParticleFilter(Node):
         normal_particle_cloud = np.zeros([normal_particle_count, 3])
 
 
-        particle_weights_sort = np.concatenate(self.particle_weights).argsort()
-        sorted_weights = self.particle_weights[particle_weights_sort[::-1]]
+        # ravel flattens the weights into one row, so this works whether they're stored as (N,) or (N, 1)
+        particle_weights_sort = np.ravel(self.particle_weights).argsort()
+        sorted_weights = np.ravel(self.particle_weights)[particle_weights_sort[::-1]]
         sorted_particles = self.particle_cloud[particle_weights_sort[::-1]]
         total_normal_weights = normal_particle_count/self.n_particles
 
         weights_to_use = 0
         #  find how many of the weights it takes to make the number of normaly
         #  distributed particles
-
-        while np.sum(sorted_weights[:weights_to_use]) < total_normal_weights:
+        # (the second check stops the loop at the last particle, in case rounding keeps the sum just under)
+        while np.sum(sorted_weights[:weights_to_use]) < total_normal_weights and weights_to_use < len(sorted_weights):
             weights_to_use += 1
         #print(weights_to_use)
 
-        normal_weights = sorted_weights[:(weights_to_use), :]
-        print(normal_weights)
+        # the kept weights only add up to about total_normal_weights, so scale them to add up to 1.
+        # otherwise the copies below only fill that fraction of normal_particle_cloud
+        normal_weights = sorted_weights[:weights_to_use] / np.sum(sorted_weights[:weights_to_use])
+        # print(normal_weights)
         count = 0
         for j in range(weights_to_use):
             for k in range(int(normal_weights[j] * normal_particle_count)):
-                normal_particle_cloud[count, :] = self.normal_particle(sorted_particles[j, :])
+                normal_particle_cloud[count, :] = self.normal_particle(sorted_particles[j, :], self.resample_xy_sigma, self.resample_theta_sigma)
                 count += 1
 
+        # the following fix was suggested by an LLM
+        # int() rounds every count down, so a few rows are left over. give them to the particles in order
+        # from heaviest, one each, instead of leaving them at (0, 0, 0)
+        j = 0
+        while count < normal_particle_count:
+            normal_particle_cloud[count, :] = self.normal_particle(sorted_particles[j % weights_to_use, :], self.resample_xy_sigma, self.resample_theta_sigma)
+            count += 1
+            j += 1
 
         self.particle_cloud = np.concatenate((random_particle_cloud, normal_particle_cloud), axis=0)
-        #print(self.particle_cloud)
+        # print(self.particle_cloud)
 
-
-        """ Resample the particles according to the new particle weights.
-            The weights stored with each particle should define the probability that a particular
-            particle is selected in the resampling step.  You may want to make use of the given helper
-            function draw_random_sample in helper_functions.py.
-        """
-        # make sure the distribution is normalized
-        self.normalize_particles()
-        # TODO: fill out the rest of the implementation
+        # every new particle starts out equal until the next laser update scores them
+        self.particle_weights = np.ones(self.n_particles) / self.n_particles
 
     def update_particles_with_laser(self, r, theta):
         """ Updates the particle weights in response to the scan data
@@ -412,7 +429,10 @@ class ParticleFilter(Node):
         if xy_theta is None:
             for i in range(self.n_particles):
                 self.particle_cloud[i, :] = self.random_particle()
-        
+        else:
+            # a guess, like a 2d pose estimate click: spread the particles around it
+            for i in range(self.n_particles):
+                self.particle_cloud[i, :] = self.normal_particle(xy_theta)
 
         # visualization code, the copy was added so as to not modify original map
         # particle_map = self.occupancy_field.map_array.copy()
@@ -433,18 +453,23 @@ class ParticleFilter(Node):
         self.normalize_particles()
         self.update_robot_pose()
 
-    def normal_particle(self, xy_theta):
+    def normal_particle(self, xy_theta, xy_sigma=None, theta_sigma=None):
+        # the spread defaults to the init spread (for a click), and resampling passes in its own smaller one
+        if xy_sigma is None:
+            xy_sigma = self.init_xy_sigma
+        if theta_sigma is None:
+            theta_sigma = self.init_theta_sigma
 
-        x = np.random.normal(xy_theta[0], self.init_xy_sigma)
-        y = np.random.normal(xy_theta[1], self.init_xy_sigma)
+        x = np.random.normal(xy_theta[0], xy_sigma)
+        y = np.random.normal(xy_theta[1], xy_sigma)
         # draw again if this spot is a wall or off the map. the cap on tries keeps a click far
         # outside the map from looping forever.
         tries = 0
         while not self.is_free(x, y) and tries < 100:
-            x = np.random.normal(xy_theta[0], self.init_xy_sigma)
-            y = np.random.normal(xy_theta[1], self.init_xy_sigma)
+            x = np.random.normal(xy_theta[0], xy_sigma)
+            y = np.random.normal(xy_theta[1], xy_sigma)
             tries += 1
-        t = self.transform_helper.angle_normalize(np.random.normal(xy_theta[2], self.init_theta_sigma))
+        t = self.transform_helper.angle_normalize(np.random.normal(xy_theta[2], theta_sigma))
         return [x, y, t]
 
 
@@ -528,7 +553,7 @@ class ParticleFilter(Node):
         x = random.randint(0, map_width - 1)
         y = random.randint(0, map_height - 1)
         # map_array holds the raw map values with rows as y and columns as x. only 0 is free space,
-        # so this skips both walls (1/home/liam/ros2_ws/src/robot_localization/maps/gauntlet.yaml00) and unknown areas outside the walls (-1).
+        # so this skips both walls (100) and unknown areas outside the walls (-1).
         while self.occupancy_field.map_array[y, x] != 0:
             x = random.randint(0, map_width - 1)
             y = random.randint(0, map_height - 1)
