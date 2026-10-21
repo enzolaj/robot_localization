@@ -19,7 +19,6 @@ from occupancy_field import OccupancyField
 from helper_functions import TFHelper
 from rclpy.qos import qos_profile_sensor_data
 from angle_helpers import quaternion_from_euler
-import random
 from scipy.ndimage import gaussian_filter		# blurs map walls into likelihood field
 
 class Particle(object):
@@ -79,7 +78,7 @@ class ParticleFilter(Node):
                                    The pose is expressed as a list [x,y,theta] (where theta is the yaw)
             thread: this thread runs your main loop
 
-            particle_cloud is stored as an N x 3 numpy array, one row [x, y, theta] per particle, in the map frame
+            particle_cloud is stored as an N x 3 numpy array, one row [x (m), y (m), theta (rad)] per particle, in the map frame
             particle_weights: one weight per particle, in the same order as particle_cloud, adding up to 1
             likelihood_field: a blurred copy of the map, indexed [x cell, y cell], that is high on and near walls
             laser_offset: the (x, y) position of the laser on the robot, relative to its center
@@ -93,7 +92,7 @@ class ParticleFilter(Node):
         self.scan_topic = "scan"		# lidar scan topic
 
         # initialize particle field
-        self.n_particles = self.declare_parameter("n_particles", 3000).value		# total number of particles
+        self.n_particles = self.declare_parameter("n_particles", 6000).value		# total number of particles
 
         # motion thresholds before triggering a filter update
         self.d_thresh = self.declare_parameter("d_thresh", 0.05).value		# linear movement threshold [m]
@@ -101,13 +100,14 @@ class ParticleFilter(Node):
 
         # resampling params, keep a fraction random to prevent particle degeneracy
         # and use smaller spread than init since resampled particles already scored well
-        self.random_resample = self.declare_parameter("random_resample", 0.15).value		# ratio of random particles [0.0 to 1.0]
+        self.random_resample = self.declare_parameter("random_resample", 0.2).value		# ratio of random particles [0.0 to 1.0]
         self.resample_xy_sigma = self.declare_parameter("resample_xy_sigma", 0.1).value		# resample x/y std dev [m]
         self.resample_theta_sigma = self.declare_parameter("resample_theta_sigma", 0.1).value		# resample yaw std dev [rad]
 
         # scoring laser scans
         self.sigma_hit = self.declare_parameter("sigma_hit", 0.3).value		# gaussian blur std dev from walls [m]
         self.min_likelihood = self.declare_parameter("min_likelihood", 0.01).value		# floor prob [0.0 to 1.0] so one bad reading cant hurt a good particle
+        self.log_scale = self.declare_parameter("log_scale", 20.0).value		# divides summed log scores since nearby beams hit the same wall and arent independent
         self.beam_step = self.declare_parameter("beam_step", 3).value		# take every k-th beam for computational speed
 
         # starting cloud spread around a 2d pose estimate click in rviz if supplied
@@ -119,7 +119,7 @@ class ParticleFilter(Node):
         self.odom_rot_noise = self.declare_parameter("odom_rot_noise", 0.1).value		# rotational noise [rad/rad]
 
         # pose estimate clustering
-        self.cluster_radius = self.declare_parameter("cluster_radius", 0.5).value		# radius around best particle to use for averaging [m]
+        self.cluster_radius = self.declare_parameter("cluster_radius", 1.0).value		# radius around best particle to use for averaging [m]
 
         # pose_listener responds to 2D Pose Estimate clicks in rviz if using initial pose
         self.create_subscription(PoseWithCovarianceStamped, 'initialpose', self.update_initial_pose, 10)
@@ -133,10 +133,10 @@ class ParticleFilter(Node):
         # keep track of timestamps from bag files so map -> odom transform uses bag time instead of wall time
         self.last_scan_timestamp = None
         self.scan_to_process = None     # current LaserScan msg for run_loop to process
-        self.particle_cloud = []        # N x 3 array, one row [x, y, theta] per particle [m, m, rad]
+        self.particle_cloud = []        # N x 3 array, one row [x (m), y (m), theta (rad)] per particle
         self.particle_weights = []      # length N array of weights [unitless], sums to 1.0
 
-        self.current_odom_xy_theta = []		# [x, y, theta] in odom frame [m, m, rad]
+        self.current_odom_xy_theta = []		# [x (m), y (m), theta (rad)] in odom frame
         self.occupancy_field = OccupancyField(self)
         self.transform_helper = TFHelper(self)
 
@@ -149,7 +149,7 @@ class ParticleFilter(Node):
         thread.start()
         self.transform_update_timer = self.create_timer(0.05, self.pub_latest_transform)		# 0.05 s period = 20 Hz
 
-        # old testing code
+        # old testing/visualization code
         # self.initialize_particle_cloud()
         # self.particle_weights = np.zeros([self.n_particles, 1])
         # self.particle_weights[10:13, 0] = 0.1
@@ -175,7 +175,7 @@ class ParticleFilter(Node):
         """
         while True:
             self.run_loop()
-            time.sleep(0.1)		# [s]
+            time.sleep(0.01)		# [s]
 
     def run_loop(self):
         """Main processing loop of the particle filter.
@@ -183,7 +183,8 @@ class ParticleFilter(Node):
         Checks if scan_to_process is available, matches it to an odometry pose via TF,
         subsamples valid laser beams in [range_min, range_max), looks up the laser's
         (x, y) mounting offset, and runs the odom, laser, pose, and resample steps
-        once movement exceeds d_thresh or a_thresh.
+        once movement exceeds d_thresh or a_thresh. The particle cloud is only published
+        after it is first made or updated, since it does not change on other scans.
         """
         if self.scan_to_process is None:
             return
@@ -198,7 +199,7 @@ class ParticleFilter(Node):
             return
 
         (r, theta) = self.transform_helper.convert_scan_to_polar_in_robot_frame(msg, self.base_frame)		# r [m], theta [rad]
-        # print("r[0]={0}, theta[0]={1}".format(r[0], theta[0]))
+        self.get_logger().debug(f"r[0]={r[0]}, theta[0]={theta[0]}")
 
         # keep every beam_step-th beam and skip readings outside valid laser range [range_min, range_max) [m]
         good_r = []
@@ -217,31 +218,38 @@ class ParticleFilter(Node):
         self.scan_to_process = None
 
         self.odom_pose = new_pose
-        new_odom_xy_theta = self.transform_helper.convert_pose_to_xy_and_theta(self.odom_pose)		# [x, y, theta] [m, m, rad]
-        # print("x: {0}, y: {1}, yaw: {2}".format(*new_odom_xy_theta))
+        new_odom_xy_theta = self.transform_helper.convert_pose_to_xy_and_theta(self.odom_pose)		# [x (m), y (m), theta (rad)]
+        self.get_logger().debug("odom pose x: {0:.2f}, y: {1:.2f}, yaw: {2:.2f}".format(*new_odom_xy_theta))
 
         if not self.current_odom_xy_theta:
             self.current_odom_xy_theta = new_odom_xy_theta
         elif len(self.particle_cloud) == 0:
             # now that we have all necessary transforms we can initialize the particle cloud
             self.initialize_particle_cloud(msg.header.stamp)
+            self.publish_particles(msg.header.stamp)		# show the starting cloud in rviz
         elif self.moved_far_enough_to_update(new_odom_xy_theta):
             # moved past d_thresh or a_thresh, run filter update
+            # perf_counter is wall time, so it only lines up with lag (bag time) when the bag plays at --rate 1
+            update_start = time.perf_counter()		# [s]
             self.update_particles_with_odom()		# move particles by odom delta
             self.update_particles_with_laser(r, theta)		# score particles against likelihood field
             self.update_robot_pose()		# estimate robot pose and update map -> odom
             self.resample_particles()		# resample cloud to focus on high-weight areas
-        # publish particles every scan so rviz stays updated
-        self.publish_particles(msg.header.stamp)
+            self.get_logger().debug(f"filter update took {time.perf_counter() - update_start:.3f} s")
+
+            # only publish after an update since the cloud doesnt change otherwise, which saves ~0.06 s per skipped scan
+            publish_start = time.perf_counter()		# [s]
+            self.publish_particles(msg.header.stamp)
+            self.get_logger().debug(f"publish took {time.perf_counter() - publish_start:.3f} s")
         lag = (self.get_clock().now() - Time.from_msg(msg.header.stamp)).nanoseconds / 1e9		# ns to [s]
-        print(f"lag {lag:.2f} s")
+        self.get_logger().debug(f"lag {lag:.2f} s")
 
     # slightly modified from initial case for angle updates
     def moved_far_enough_to_update(self, new_odom_xy_theta):
         """Checks if the robot drove more than d_thresh or turned more than a_thresh.
 
         Args:
-            new_odom_xy_theta (Sequence[float]): Current [x, y, theta] pose in odom frame [m, m, rad].
+            new_odom_xy_theta (Sequence[float]): Current [x (m), y (m), theta (rad)] pose in odom frame.
 
         Returns:
             bool: True if linear change > d_thresh or angular change > a_thresh.
@@ -274,10 +282,11 @@ class ParticleFilter(Node):
         Since delta is measured in the odom frame, it is first rotated by the robot's
         old heading into the local body frame (forward, left, turn).
         That motion is then applied along each particle's own heading with Gaussian
-        noise scaled by distance driven and angle turned.
+        noise scaled by distance driven and angle turned, updating every particle at
+        once as numpy arrays instead of looping over them.
         """
         new_odom_xy_theta = self.transform_helper.convert_pose_to_xy_and_theta(self.odom_pose)
-        # compute change in (x, y, theta) since last update [m, m, rad]
+        # compute change in (x (m), y (m), theta (rad)) since last update
         if self.current_odom_xy_theta:
             old_odom_xy_theta = self.current_odom_xy_theta
             delta = (new_odom_xy_theta[0] - self.current_odom_xy_theta[0],
@@ -301,20 +310,22 @@ class ParticleFilter(Node):
         trans_noise = self.odom_trans_noise * distance		# translational std dev [m]
         rot_noise = self.odom_rot_noise * abs(turn)		# rotational std dev [rad]
 
-        for i in range(len(self.particle_cloud)):
-            x, y, heading = self.particle_cloud[i]
+        n = len(self.particle_cloud)
+        heading = self.particle_cloud[:, 2]		# every particle's heading, length N
 
-            # give each particle delta in each direction plus additional scaled noise so that the cloud moves with more info
-            noisy_forward = forward + np.random.normal(0, trans_noise)		# [m]
-            noisy_left = left + np.random.normal(0, trans_noise)		# [m]
-            noisy_turn = turn + np.random.normal(0, rot_noise)		# [rad]
+        # give each particle delta in each direction plus additional scaled noise so that the cloud moves with more info
+        # passing n to np.random.normal draws a different noise sample for every particle at once
+        noisy_forward = forward + np.random.normal(0, trans_noise, n)		# length N [m]
+        noisy_left = left + np.random.normal(0, trans_noise, n)		# length N [m]
+        noisy_turn = turn + np.random.normal(0, rot_noise, n)		# length N [rad]
 
-            # rotate local move by this particle's heading to update its map (x, y)
-            x = x + noisy_forward * math.cos(heading) - noisy_left * math.sin(heading)
-            y = y + noisy_forward * math.sin(heading) + noisy_left * math.cos(heading)
-            heading = self.transform_helper.angle_normalize(heading + noisy_turn)		# wrap to [-pi, pi]
+        # rotate local move by each particle's own heading to update its map (x, y)
+        self.particle_cloud[:, 0] += noisy_forward * np.cos(heading) - noisy_left * np.sin(heading)
+        self.particle_cloud[:, 1] += noisy_forward * np.sin(heading) + noisy_left * np.cos(heading)
 
-            self.particle_cloud[i] = [x, y, heading]
+        # wrap to [-pi, pi], uses np.arctan2 since angle_normalize uses math.atan2 which only takes one number
+        new_heading = heading + noisy_turn
+        self.particle_cloud[:, 2] = np.arctan2(np.sin(new_heading), np.cos(new_heading))
 
     def resample_particles(self):
         """Resamples the particle cloud according to particle_weights.
@@ -327,17 +338,12 @@ class ParticleFilter(Node):
         # make sure distribution sums to 1.0
         self.normalize_particles()
 
-        # first determine the number of random particles and create random particle array of that size
+        # first determine the number of random particles and make that many at once
         random_particle_count = math.floor(self.n_particles * self.random_resample)
-        random_particle_cloud = np.zeros([random_particle_count, 3])		# shape (N_rand, 3)
-
-        # make random particles
-        for i in range(random_particle_count):
-            random_particle_cloud[i, :] = self.random_particle()
+        random_particle_cloud = self.random_particles(random_particle_count)		# shape (N_rand, 3)
 
         # treat remaining particles as normal particles based on previous sample
         normal_particle_count = self.n_particles - random_particle_count
-        normal_particle_cloud = np.zeros([normal_particle_count, 3])		# shape (N_norm, 3)
 
         # ravel flattens weights into 1D row so argsort works whether shape is (N,) or (N, 1)
         particle_weights_sort = np.ravel(self.particle_weights).argsort()
@@ -345,33 +351,30 @@ class ParticleFilter(Node):
         sorted_particles = self.particle_cloud[particle_weights_sort[::-1]]
         total_normal_weights = normal_particle_count / self.n_particles		# target weight sum [0.0 to 1.0]
 
-        weights_to_use = 0
         # find how many top weights it takes to reach total_normal_weights
-        # second check stops at the last particle in case float rounding keeps sum slightly under
-        while np.sum(sorted_weights[:weights_to_use]) < total_normal_weights and weights_to_use < len(sorted_weights):
-            weights_to_use += 1
-        # print(weights_to_use)
+        # cumsum[k] is the sum of the top k + 1 weights, and searchsorted finds the first spot it reaches the target
+        # min() stops at the last particle in case float rounding keeps sum slightly under
+        weight_sums = np.cumsum(sorted_weights)
+        weights_to_use = min(np.searchsorted(weight_sums, total_normal_weights) + 1, len(sorted_weights))
+        self.get_logger().debug(f"weights_to_use: {weights_to_use}")
 
         # kept weights only sum to ~total_normal_weights, so scale them to sum to 1.0
-        # otherwise the loop below would only fill that fraction of normal_particle_cloud
+        # otherwise the copies below would only fill that fraction of normal_particle_count
         normal_weights = sorted_weights[:weights_to_use] / np.sum(sorted_weights[:weights_to_use])
-        # print(normal_weights)
-        count = 0
-        for j in range(weights_to_use):
-            for k in range(int(normal_weights[j] * normal_particle_count)):
-                normal_particle_cloud[count, :] = self.normal_particle(sorted_particles[j, :], self.resample_xy_sigma, self.resample_theta_sigma)
-                count += 1
+        self.get_logger().debug(f"normal_weights: {normal_weights}")
+        copies = (normal_weights * normal_particle_count).astype(int)		# copies of each kept particle
 
-        # fix with LLM: int() rounds every count down, leaving a few rows at (0, 0, 0)
-        # give leftover slots to the heaviest particles in order, 1 each
-        j = 0
-        while count < normal_particle_count:
-            normal_particle_cloud[count, :] = self.normal_particle(sorted_particles[j % weights_to_use, :], self.resample_xy_sigma, self.resample_theta_sigma)
-            count += 1
-            j += 1
+        # fix with LLM: int() rounds every count down, leaving a few slots unfilled
+        # give leftover slots to the heaviest particles in order, 1 each. each count loses less than 1
+        # when rounded down, so there are always fewer leftovers than kept particles
+        copies[:normal_particle_count - np.sum(copies)] += 1
+
+        # np.repeat lists kept particle j copies[j] times in a row, then each copy gets its own gaussian noise
+        centers = np.repeat(sorted_particles[:weights_to_use], copies, axis=0)		# shape (N_norm, 3)
+        normal_particle_cloud = self.normal_particles(centers, self.resample_xy_sigma, self.resample_theta_sigma)
 
         self.particle_cloud = np.concatenate((random_particle_cloud, normal_particle_cloud), axis=0)
-        # print(self.particle_cloud)
+        self.get_logger().debug(f"particle_cloud: {self.particle_cloud}")
 
         # every new particle starts with equal weight (1/N) until the next laser update scores them
         self.particle_weights = np.ones(self.n_particles) / self.n_particles
@@ -379,9 +382,10 @@ class ParticleFilter(Node):
     def update_particles_with_laser(self, r, theta):
         """Updates particle_weights by scoring laser scan endpoints against likelihood_field.
 
-        For each particle, cast the scan (r, theta) onto the map and look up every beam endpoint
-        in likelihood_field. Sums log-probabilities across beams so multiplying hundreds of small
-        probabilities does not round down to 0.
+        Casts the scan (r, theta) from every particle onto the map at once as an N x B array
+        (N particles, B beams) and looks up every beam endpoint in likelihood_field. Sums
+        log-probabilities across beams so multiplying hundreds of small probabilities does not
+        round down to 0.
 
         Args:
             r (np.ndarray): Obstacle distance readings [m].
@@ -389,30 +393,30 @@ class ParticleFilter(Node):
         """
         # beam endpoints in robot frame
         # theta already accounts for laser yaw, laser_offset accounts for laser sitting slightly off-center on the robot
-        beam_x = self.laser_offset[0] + r * np.cos(theta)		# [m] in base_frame
-        beam_y = self.laser_offset[1] + r * np.sin(theta)		# [m] in base_frame
+        beam_x = self.laser_offset[0] + r * np.cos(theta)		# length B [m] in base_frame
+        beam_y = self.laser_offset[1] + r * np.sin(theta)		# length B [m] in base_frame
 
-        # initialize score keeping per particle
-        n = len(self.particle_cloud)
-        log_scores = np.zeros(n)
-        for i in range(n):
-            x, y, heading = self.particle_cloud[i]
+        # slicing with 0:1 keeps each column as shape (N, 1) instead of (N,) so it broadcasts against the beams
+        x = self.particle_cloud[:, 0:1]		# shape (N, 1)
+        y = self.particle_cloud[:, 1:2]		# shape (N, 1)
+        heading = self.particle_cloud[:, 2:3]		# shape (N, 1)
 
-            # rotate beam endpoints by particle heading and shift by particle (x, y) into map frame
-            end_x = x + beam_x * math.cos(heading) - beam_y * math.sin(heading)		# [m] in map frame
-            end_y = y + beam_x * math.sin(heading) + beam_y * math.cos(heading)		# [m] in map frame
+        # rotate beam endpoints by particle heading and shift by particle (x, y) into map frame
+        # (N, 1) combined with (B,) broadcasts to (N, B), so row i holds particle i's endpoint for every beam
+        end_x = x + beam_x * np.cos(heading) - beam_y * np.sin(heading)		# shape (N, B) [m] in map frame
+        end_y = y + beam_x * np.sin(heading) + beam_y * np.cos(heading)		# shape (N, B) [m] in map frame
 
-            # look up endpoints in likelihood_field
-            # off-map beams would only get min_likelihood floor since later add the actual probability
-            ix, iy, on_map = self.world_to_cell(end_x, end_y)		# cell indices [cells]
-            # initialize probabilities with min_likelihood across all, then add the likelihood
-            beam_probs = np.full(len(r), self.min_likelihood)
-            beam_probs[on_map] += self.likelihood_field[ix[on_map], iy[on_map]]
+        # look up endpoints in likelihood_field
+        # off-map beams would only get min_likelihood floor since later add the actual probability
+        ix, iy, on_map = self.world_to_cell(end_x, end_y)		# cell indices [cells], each shape (N, B)
+        # initialize probabilities with min_likelihood across all, then add the likelihood
+        beam_probs = np.full(end_x.shape, self.min_likelihood)
+        beam_probs[on_map] += self.likelihood_field[ix[on_map], iy[on_map]]
 
-            # probability of scan = total beam probabilities through multiplication (adding = avg score, which is
-            # more prone to thinking a bad scan is good) but multiplying approaches 0 for probabilities, so we
-            # add logs of scores
-            log_scores[i] = np.sum(np.log(beam_probs))
+        # probability of scan = total beam probabilities through multiplication (adding = avg score, which is
+        # more prone to thinking a bad scan is good) but multiplying approaches 0 for probabilities, so we
+        # add logs of scores. axis=1 sums across each row (the beams), giving one score per particle
+        log_scores = np.sum(np.log(beam_probs), axis=1) / self.log_scale		# length N
 
         # subtract max log_score before exp() so the best particle gets weight = 1.0 before normalizing
         # and nothing goes to 0
@@ -426,8 +430,9 @@ class ParticleFilter(Node):
         Args:
             msg (PoseWithCovarianceStamped): Pose estimate message in map frame.
         """
-        xy_theta = self.transform_helper.convert_pose_to_xy_and_theta(msg.pose.pose)		# [m, m, rad]
+        xy_theta = self.transform_helper.convert_pose_to_xy_and_theta(msg.pose.pose)		# [x (m), y (m), theta (rad)]
         self.initialize_particle_cloud(msg.header.stamp, xy_theta)
+        self.publish_particles(msg.header.stamp)		# show the new cloud right away instead of waiting for the robot to move
 
     def initialize_particle_cloud(self, timestamp=0, xy_theta=None):
         """Initializes particle_cloud with n_particles hypotheses.
@@ -438,19 +443,15 @@ class ParticleFilter(Node):
 
         Args:
             timestamp (builtin_interfaces.msg.Time | int): Message timestamp (default = 0).
-            xy_theta (Sequence[float] | None): Mean [x, y, theta] pose [m, m, rad] to
+            xy_theta (Sequence[float] | None): Mean [x (m), y (m), theta (rad)] pose to
                 initialize around, or None for full-map random initialization.
         """
-        # initialize empty array
-        self.particle_cloud = np.zeros((self.n_particles, 3))
         # create particles randomly
         if xy_theta is None:
-            for i in range(self.n_particles):
-                self.particle_cloud[i, :] = self.random_particle()
+            self.particle_cloud = self.random_particles(self.n_particles)
         else:
-            # pose estimate, so spread particles around xy_theta
-            for i in range(self.n_particles):
-                self.particle_cloud[i, :] = self.normal_particle(xy_theta)
+            # pose estimate, so spread particles around xy_theta (np.tile makes xy_theta the center of every particle)
+            self.particle_cloud = self.normal_particles(np.tile(xy_theta, (self.n_particles, 1)))
 
         # visualization code with copy() added so we dont modify original map_array
         # particle_map = self.occupancy_field.map_array.copy()
@@ -470,18 +471,18 @@ class ParticleFilter(Node):
         self.normalize_particles()
         self.update_robot_pose()
 
-    def normal_particle(self, xy_theta, xy_sigma=None, theta_sigma=None):
-        """Draws one particle [x, y, theta] from a Gaussian around xy_theta.
+    def normal_particles(self, centers, xy_sigma=None, theta_sigma=None):
+        """Draws one particle [x, y, theta] from a Gaussian around each row of centers.
 
-        Redraws (x, y) up to 100 times if the sampled point lands in a wall or off-map.
+        Redraws (x, y) up to 100 times for any particle that lands in a wall or off-map.
 
         Args:
-            xy_theta (Sequence[float]): Mean [x, y, theta] pose [m, m, rad].
+            centers (np.ndarray): M x 3 array of mean [x (m), y (m), theta (rad)] poses, one per particle.
             xy_sigma (float | None): x/y std dev [m] (default = self.init_xy_sigma).
             theta_sigma (float | None): Yaw std dev [rad] (default = self.init_theta_sigma).
 
         Returns:
-            list[float]: Sampled [x, y, theta] particle [m, m, rad].
+            np.ndarray: M x 3 array of sampled [x (m), y (m), theta (rad)] particles.
         """
         # defaults to init spread (like for initial pose), resampling gives this function another sigma
         if xy_sigma is None:
@@ -489,16 +490,20 @@ class ParticleFilter(Node):
         if theta_sigma is None:
             theta_sigma = self.init_theta_sigma
 
-        x = np.random.normal(xy_theta[0], xy_sigma)		# [m]
-        y = np.random.normal(xy_theta[1], xy_sigma)		# [m]
-        # redraw if spot is a wall or off-map, cap at 100 tries to avoid looping forever
-        tries = 0
-        while not self.is_free(x, y) and tries < 100:
-            x = np.random.normal(xy_theta[0], xy_sigma)
-            y = np.random.normal(xy_theta[1], xy_sigma)
-            tries += 1
-        t = self.transform_helper.angle_normalize(np.random.normal(xy_theta[2], theta_sigma))		# wrapped to [-pi, pi] [rad]
-        return [x, y, t]
+        m = len(centers)
+        particles = np.empty((m, 3))
+        particles[:, :2] = centers[:, :2] + np.random.normal(0, xy_sigma, (m, 2))		# x and y [m]
+        # redraw only the particles in a wall or off-map, cap at 100 tries to avoid looping forever
+        for _ in range(100):
+            bad = ~self.is_free(particles[:, 0], particles[:, 1])		# true for particles that need a redraw
+            if not bad.any():
+                break
+            particles[bad, :2] = centers[bad, :2] + np.random.normal(0, xy_sigma, (np.sum(bad), 2))
+
+        # wrap to [-pi, pi], uses np.arctan2 since angle_normalize uses math.atan2 which only takes one number
+        theta = centers[:, 2] + np.random.normal(0, theta_sigma, m)		# [rad]
+        particles[:, 2] = np.arctan2(np.sin(theta), np.cos(theta))
+        return particles
 
 
     def normalize_particles(self):
@@ -535,12 +540,16 @@ class ParticleFilter(Node):
         """Callback for incoming laser scans on scan_topic.
 
         Updates last_scan_timestamp and stores the message in scan_to_process if
-        run_loop is done with the previous scan.
+        run_loop is done with the previous scan. Also logs (at debug level) how old
+        the scan already is when it arrives, to separate that from processing lag.
 
         Args:
             msg (LaserScan): Incoming laser scan message.
         """
         self.last_scan_timestamp = msg.header.stamp
+        # how old the scan already is when it reaches us, before run_loop does anything with it
+        arrival_age = (self.get_clock().now() - Time.from_msg(msg.header.stamp)).nanoseconds / 1e9		# ns to [s]
+        self.get_logger().debug(f"scan arrived {arrival_age:.3f} s after its timestamp")
         # throw away scans until we finish processing the previous scan (run_loop sets scan_to_process = None)
         if self.scan_to_process is None:
             self.scan_to_process = msg
@@ -572,7 +581,11 @@ class ParticleFilter(Node):
         walls = (grid > 0).astype(float)
         blurred = gaussian_filter(walls, self.sigma_hit / self.map_resolution, mode="constant")
         # scale so highest value on walls is 1.0 to match our probabilities scaling
-        self.likelihood_field = blurred / np.max(blurred)
+        self.likelihood_field = np.minimum(blurred / np.median(blurred[walls > 0]), 1.0)
+
+        # every free cell's (iy, ix) indices, found once here so random_particles can pick from them directly
+        # instead of guessing random cells until it hits a free one. map_array is indexed [y, x]
+        self.free_iy, self.free_ix = np.nonzero(self.occupancy_field.map_array == 0)
 
     def world_to_cell(self, x, y):
         """Converts map coordinates (x, y) into grid cell indices (ix, iy).
@@ -609,44 +622,52 @@ class ParticleFilter(Node):
         transform = self.transform_helper.tf_buffer.lookup_transform(self.base_frame, laser_frame, Time())
         return (transform.transform.translation.x, transform.transform.translation.y)
 
-    def random_particle(self):
-        """Returns one particle [x, y, theta] at a random free spot on the map by picking
-        random grid cells until finding one that is free (0), then converts a random sub-cell
-          point inside that cell into meters and picks a random yaw in [-pi, pi].
+    def random_particles(self, n):
+        """Returns n particles [x, y, theta] at random free spots on the map.
 
-        Returns:
-            list[float]: Random [x, y, theta] particle [m, m, rad].
-        """
-        map_width = self.occupancy_field.map.info.width		# [cells]
-        map_height = self.occupancy_field.map.info.height		# [cells]
-        # give initial random value for x,y on the map
-        x = random.randint(0, map_width - 1)		# x index [cells]
-        y = random.randint(0, map_height - 1)		# y index [cells]
-        # ensure this point is a valid spot on the map by checking the map array, note that map_array is indexed [y, x]
-        # its in cells here so we dont use is_free
-        while self.occupancy_field.map_array[y, x] != 0:
-            x = random.randint(0, map_width - 1)
-            y = random.randint(0, map_height - 1)
-        t = random.uniform(-math.pi, math.pi)		# random heading
-
-        # convert cell to meters, adding random.random() [0, 1) to cell to land somewhere inside the cell
-        # as opposed to always on some grid
-        x_meters = self.map_origin_x + (x + random.random()) * self.map_resolution
-        y_meters = self.map_origin_y + (y + random.random()) * self.map_resolution
-        return [x_meters, y_meters, t]
-
-    def is_free(self, x, y):
-        """Checks if the point (x, y) is on the map and in free space (0).
+        Picks n random cells from the free cells saved in build_likelihood_field, converts a
+        random sub-cell point inside each cell into meters, and picks a random yaw in [-pi, pi].
 
         Args:
-            x (float): x-coordinate in map frame [m].
-            y (float): y-coordinate in map frame [m].
+            n (int): Number of particles to make.
 
         Returns:
-            bool: True if (x, y) is inside map bounds and map_array[iy, ix] == 0.
+            np.ndarray: n x 3 array of random [x (m), y (m), theta (rad)] particles.
+        """
+        pick = np.random.randint(0, len(self.free_ix), n)		# index into the free cell list for each particle
+        # convert cell to meters, adding np.random.random() [0, 1) to cell to land somewhere inside the cell
+        # as opposed to always on some grid
+        x = self.map_origin_x + (self.free_ix[pick] + np.random.random(n)) * self.map_resolution		# [m]
+        y = self.map_origin_y + (self.free_iy[pick] + np.random.random(n)) * self.map_resolution		# [m]
+        theta = np.random.uniform(-math.pi, math.pi, n)		# random heading [rad]
+        return np.column_stack((x, y, theta))
+
+    def random_particle(self):
+        """Returns one particle [x, y, theta] at a random free spot on the map.
+
+        Returns:
+            np.ndarray: Random [x (m), y (m), theta (rad)] particle.
+        """
+        return self.random_particles(1)[0]
+
+    def is_free(self, x, y):
+        """Checks if the point(s) (x, y) are on the map and in free space (0).
+
+        Works on both single floats or vectorized numpy arrays.
+
+        Args:
+            x (float | np.ndarray): x-coordinate(s) in map frame [m].
+            y (float | np.ndarray): y-coordinate(s) in map frame [m].
+
+        Returns:
+            bool | np.ndarray: True where (x, y) is inside map bounds and map_array[iy, ix] == 0.
         """
         ix, iy, on_map = self.world_to_cell(x, y)
-        return bool(on_map) and self.occupancy_field.map_array[iy, ix] == 0		# 0 = free cell
+        # clip off-map indices onto the map edge so the lookup cant go out of range, on_map then marks them not free
+        height, width = self.occupancy_field.map_array.shape		# [cells]
+        ix = np.clip(ix, 0, width - 1)
+        iy = np.clip(iy, 0, height - 1)
+        return on_map & (self.occupancy_field.map_array[iy, ix] == 0)		# 0 = free cell
 
     def estimate_pose(self):
         """Returns the best guess of the robot's pose as (x, y, theta).
@@ -657,30 +678,26 @@ class ParticleFilter(Node):
         while using only the single best particle makes the estimate jump around between updates.
 
         Returns:
-            tuple[float, float, float]: Estimated (x, y, theta) pose in map frame [m, m, rad].
+            tuple[float, float, float]: Estimated (x (m), y (m), theta (rad)) pose in map frame.
         """
         # get index of highest weight to find best particle's position
         best = np.argmax(self.particle_weights)
         best_x, best_y, _ = self.particle_cloud[best]		# best particle position
 
-        total_weight = 0.0
-        sum_x = 0.0		# weighted x sum [m]
-        sum_y = 0.0		# weighted y sum [m]
-        sum_cos = 0.0		# weighted unit vector x
-        sum_sin = 0.0		# weighted unit vector y
-        for i in range(len(self.particle_cloud)):
-            x, y, theta = self.particle_cloud[i]
-            w = self.particle_weights[i]
-            if math.hypot(x - best_x, y - best_y) < self.cluster_radius:
-                total_weight += w
-                sum_x += w * x
-                sum_y += w * y
-                # headings cant be averaged as plain numbers (+179 deg and -179 deg would average to 0 deg,
-                # the opposite direction). average them as unit vectors (cos, sin) and take atan2 for the angle
-                sum_cos += w * math.cos(theta)
-                sum_sin += w * math.sin(theta)
+        # true for every particle within cluster_radius of the best one, only those get averaged
+        x = self.particle_cloud[:, 0]
+        y = self.particle_cloud[:, 1]
+        near = np.hypot(x - best_x, y - best_y) < self.cluster_radius		# length N true/false mask
+        theta = self.particle_cloud[near, 2]
+        w = self.particle_weights[near]
 
-        return (sum_x / total_weight, sum_y / total_weight, math.atan2(sum_sin, sum_cos))
+        avg_x = np.sum(w * x[near]) / np.sum(w)		# weighted average x [m]
+        avg_y = np.sum(w * y[near]) / np.sum(w)		# weighted average y [m]
+        # headings cant be averaged as plain numbers (+179 deg and -179 deg would average to 0 deg,
+        # the opposite direction). average them as unit vectors (cos, sin) and take atan2 for the angle
+        avg_theta = math.atan2(np.sum(w * np.sin(theta)), np.sum(w * np.cos(theta)))		# [rad]
+
+        return (avg_x, avg_y, avg_theta)
 
 def main(args=None):
     """Initializes ROS2, spins the ParticleFilter node, and shuts down on exit."""
