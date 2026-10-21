@@ -330,7 +330,7 @@ For example, in `test_robot_pose_becomes_the_map_to_odom_transform`, odometry re
 
 Two limitations apply here. Because `cluster_radius` is fixed, part of the cloud is left out of the average right after initialization, when the cloud is wider than 1 m, and since the node publishes no covariance, downstream nodes cannot tell a confident estimate from an uncertain one.
 
-<p align="center"> <img src="docs/map_odom.png" alt="map, odom, and robot frames"> </p> <p align="center"><em>Figure 6: The worked example above. Odometry places the robot 1 m along odom's x axis, so for the robot to sit at (3, 2) facing +y on the map, the odom frame must sit at (3, 1), rotated 90°.</em></p>
+<p align="center"> <img src="docs/map_odom.png" alt="map, odom, and robot frames"> </p> <p align="center"><em>Figure 5: The worked example above. Odometry places the robot 1 m along odom's x axis, so for the robot to sit at (3, 2) facing +y on the map, the odom frame must sit at (3, 1), rotated 90°.</em></p>
 
 
 ### <a name="resampling" id="resampling"></a>2.5 Particle Resampling
