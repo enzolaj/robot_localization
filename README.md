@@ -48,7 +48,7 @@ Keeping a cloud instead of a single estimate has the advantage of holding severa
 
 Our implementation follows the particle filter and Monte Carlo Localization algorithms described in *Probabilistic Robotics* by Thrun, Burgard, and Fox (ch. 4 and ch. 8), visualized on a high level below in Figure 1.
 
-<p align="center"> <img src="docs/mcl_loop.png" alt="The predict, correct, resample loop"> </p> <p align="center"><em>Figure 1: The MCL loop. [TODO: make this diagram]</em></p>
+<p align="center"> <img src="docs/mcl_loop.png" alt="The predict, correct, resample loop"> </p> <p align="center"><em>Figure 1: The MCL loop.</em></p>
 
 ### 1.2 Architecture
 
