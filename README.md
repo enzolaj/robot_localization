@@ -1,561 +1,479 @@
-# Robot Localization Project
+# Robot Localization via Monte Carlo Particle Filter
+
 Author Names: Liam B., Enzo S.
 
 For Olin ENGR3590 Computational Introduction to Robotics
 
-This README is a comprehensive report that contains both conceptual and programmatic  information regarding implementation details of our Lazy Neato project. For clarity, the parameters detailed below were from our initial testing; however, for certain gifs and bag recordings, we modified them to better show the individual behavior. 
+This README is a comprehensive report covering both the conceptual math and the programmatic implementation of our Monte Carlo Localization (MCL) particle filter. Unless stated otherwise, the parameters in the tables below are the defaults declared in `pf.py`; a few figures and recordings were made with different values (mainly `n_particles`), though this is noted in line.  All results come from the two Turtlebot 4 bags recorded on the first floor of the MAC, [`bags/macfirst_floor_take_1`](bags/macfirst_floor_take_1) and [`bags/macfirst_floor_take_2`](bags/macfirst_floor_take_2). For our purposes, the parameters were set with these environments in mind as opposed to the Neato Gauntlet World. 
 
 ## 1. Project Overview
 
-The goal of this project is to learn, experiment with, and gain overall familiarity
-with ROS2, the Python framework, the robotics development cycle, and debugging
-tools and practices. As detailed throughout the rest of this writeup, this
-project includes not only the use of finite state machine patterns, but also a
-variety of real-life robotic behaviors, such as:
+Given a robot in a known environment, we can poll the robot's sensors to determine what it "sees" around itself; however, there is no direct way from our known environment, or map, to extract the pose of the robot itself. Thus, we simulate thousands of particles and mimic the same sensing the robot experiences as the particles. Through this, we can determine which particles are likely to match our robot's pose, and without directly interacting with the robot, extract said robot's pose through this external algorithmic layer. Picture the robot switched on somewhere on the first floor of the MAC (a building at Olin). It has a map of the building and two sensors: wheel odometry, which reports how far it has driven, and a 2D lidar, which reports how far away the nearest surface is in every direction.  Indepdently, these sensors are unable to provide sufficient information for pose extraction. Using odometry can only describe motion relative to the robot's starting location and the lidar can only describe the surrounding area with minimal ability to differentiate between seemingly similar environments. The goal of this project is to combine the two in a particle filter that keeps track of the robot's pose on a known occupancy grid map in ROS2.
 
-- [Driving in a square](#driving-in-a-square)
-- [Wall following](#wall-following)
-- [Cookie following](#cookie-following)
-- [Collision avoidance / safety e-stop](#collision-avoidance)
+The filter runs as a single node, `pf.py`, with five stages:
 
-All sensors and hardware used are built into the Neato. No additional hardware or
-technology is used, but advanced software techniques, including RANSAC, shape
-fitting, data filtering, and proportional control, are adopted
-and used in practice.
+- [Particle cloud initialization & likelihood field precomputation](#map-and-init)
+- [Motion model (odometry update)](#motion-model)
+- [Sensor model (laser scan scoring)](#sensor-model)
+- [Pose estimation & the map to odom transform](#pose-estimate)
+- [Resampling](#resampling)
 
-Jack mainly worked on the state machine and organizing the structure of our deliverables as well as the safety node. Enzo contributed mainly to the development of the cookie following behavior as well as outlining the basis of all the other files. Irene mainly contributed to the wall following behavior. All members came together during work meetings to discuss ideas and implemented them independently on their own time. This README, which is our report, was co-developed by all three members with their respective behaviors. 
+External but necesarry to this process, we use 2D Gaussian convolution (`scipy.ndimage.gaussian_filter`) to build the likelihood field, rigid body frame transformations to move scans and particles between frames, log-likelihood summation with a scaling constant (`log_scale`) to score particles, vectorized NumPy array operations and broadcasting to update thousands of particles at once, and a circular mean to average headings.
 
-## 2. Individual Behaviors
 
-Here are the details of each individual behavior, discussing the programmatic implementation, the theory behind it, and how it fits into the broader architecture.
+[TODO: division of labor paragraph, e.g. who wrote which methods, who tuned parameters on the bag files, who wrote the tests, and how the README was split up.]
 
-### <a name="driving-in-a-square" id="driving-in-a-square"></a>2.1 Driving in a Square
- 
-#### 2.1.1 Description
- 
-This behavior does exactly what the name suggests: the Neato drives in a square. The Neato completes the square exactly once and returns to its initial state with roughly the same position and orientation.
- 
-#### 2.1.2 Architecture
- 
-*Table 1: Square-drive node topics; subscribers and publishers with their roles and when they're called.*
- 
-| Topic                | Direction | Message type          | When                                          | Role                                                         |
-| -------------------- | --------- | --------------------- | --------------------------------------------- | ------------------------------------------------------------ |
-| `/state`             | subscribe | `std_msgs/String`     | on controller broadcast                       | Sets `is_active` true only when the state is `SQUARE_DRIVE`  |
-| `/desired_cmd_vel`   | publish   | `geometry_msgs/Twist` | every timer tick (10 Hz)<br>-<br>while active | Drive or turn command sent to the safety node                |
-| `/drive_square_done` | publish   | `std_msgs/String`     | once<br>-<br>after the fourth side            | Moves the controller from `SQUARE_DRIVE` to `WALL_FOLLOWING` |
- 
-*Table 2: Square-drive parameters.*
- 
-| Parameter        | Value     | Role                                                  |
-| ---------------- | --------- | ----------------------------------------------------- |
-| `forward_speed`  | 0.3 m/s   | linear speed during `DRIVE`                           |
-| `turn_speed`     | 0.6 rad/s | angular speed during `TURN`                           |
-| `drive_duration` | 3 s       | length of each `DRIVE` phase; nominal side of 0.9 m   |
-| `turn_duration`  | 2.7 s     | length of each `TURN` phase; nominal turn of 1.62 rad |
-| `num_sides`      | 4         | `DRIVE` phases before the square is complete          |
-| timer period     | 0.1 s     | control loop rate (10 Hz)                             |
-| initial `phase`  | `TURN`    | first phase on entry                                  |
+### 1.1 Monte Carlo Localization in Brief
 
-#### 2.1.3 Design & Implementation
- 
-The drive-square behavior is implemented through a simple time-based approach. The node commands a fixed forward speed for a fixed duration to produce each side, then a fixed angular speed for a fixed duration to produce each corner. We chose this over an odometry-based controller because the square is only the first state of the FSM cycle, and its accuracy does not affect the wall-following or cookie-following behaviors. The time saved went toward those behaviors and our individual learning goals.
- 
-The node's only input is the `/state` topic. It publishes velocity commands on `/desired_cmd_vel` and, once the square is finished, a completion message on `/drive_square_done`. We used a separate completion topic rather than letting the node write to `/state` itself so that the FSM controller remains the only node that ever changes the state. The square node reports that it is done, and the controller decides what happens next.
+Before getting into the code, we will describe the algorithm on its own. A particle is a single guess of the robot's pose, $[x\ (\mathrm{m}),\ y\ (\mathrm{m}),\ \theta\ (\mathrm{rad})]$, in the map frame, and its weight describes how well the most recent laser scan aligns with that guess. The filter keeps thousands of these guesses at once and repeats three steps every time the robot moves far enough:
 
-In the `state_callback` function, we compare the new value of `is_active` with the previous one, which means that we only activate on a state change and not on every state message. This architecture is used for actuation in the other behaviors as well.
- 
-The motion itself runs in `run_loop`, which uses a 10 Hz timer to send its messages. If the node is inactive, the callback returns immediately and publishes nothing. Otherwise, it calls `compute_command`, which checks how long the current phase has lasted. In a `TURN` phase, the node commands `turn_speed` until `turn_duration` s have elapsed, then switches to `DRIVE`. In a `DRIVE` phase, it commands `forward_speed` until `drive_duration` s have elapsed, then increments `turns_completed` and switches back to `TURN`. Each switch records a new phase start time.
- 
-The square begins with a turn rather than a drive. When the robot enters `SQUARE_DRIVE` right after eating a cookie, the cookie is still directly ahead, so driving first would run into it.
- 
-After the fourth `DRIVE` phase, `finish_square()` clears `is_active` and publishes `DRIVE_SQUARE_DONE` on `/drive_square_done`. The command for that tick is left at zero, so the robot stops cleanly on the last side. The controller then moves to `WALL_FOLLOWING`.
- 
-#### 2.1.4 Limitations
-
-Because we are not using a closed-loop approach (e.g., odometry), we never have any information about the actual state of the Neato or the square. Therefore, if a disturbance acts on the Neato, it cannot detect and react to it to still produce the square.
-
-Additionally, we tuned the durations by observation rather than deriving them. The theoretical turn duration, derived by dividing the turn angle (90 degrees) by the angular speed, did not produce a 90-degree turn. This was likely due to a simulator bug in the original Neato SDF file that affected the wheels' grip on the surface; however, we did not deem it necessary to change afterwards, as the square was "good enough." The approach also assumes that the Neato accelerates instantaneously, which is not true.
-
-#### 2.1.5 Demonstration
-
-<p align="center"> <img src="docs/square_drive.gif" alt="Neato driving in a square"> </p> <p align="center"><em>Figure 1: Neato driving in a square.</em></p>
-
-See the recorded bag at [`bags/drive_square`](bags/drive_square).
-
-### <a name="wall-following" id="wall-following"></a>2.2 Wall Following
-
-Basic wall following was implemented under the assumption that the walls were relatively connected, with easily identifiable corners, and did not contain small corridors. For ease of transition from the `drive_square` behavior to `wall_following`, the Neato follows the wall on its right side. The ray indices are currently set for the right wall; `self.side` sets the direction of the corner turn, and following the left wall would use indices 90 and 70 instead.
-
-The wall-following module uses incoming `LaserScan` messages from the `/scan` topic to determine whether the Neato should continue following the wall or turn at an upcoming corner. Both parallel drive and corner handling determine angular velocity, while linear velocity is constant at $0.2\,\mathrm{m/s}$.
-
-#### 2.2.1 Second-Order System Approximation
-
-We model the parallel wall-following behavior as an approximate second-order system. The two quantities describing the robot relative to the wall are defined as
-
-$$
-e(t) = d(t) - d_{\mathrm{target}},
-$$
-
-$$
-\alpha(t) = \text{heading error relative to the wall},
-$$
-
-where $e(t)$ is the lateral distance error and $\alpha(t)$ is the orientation error.
-
-During parallel drive, the Neato subscribes to the `/scan` topic and uses two LiDAR points to triangulate its position and heading relative to the wall. For right-wall following, these points are `msg.ranges[270]` and `msg.ranges[290]`, while for left-wall following they are `msg.ranges[90]` and `msg.ranges[70]`. This triangulation is used to estimate the Neato's distance and heading relative to the wall, represented by $e$ and $\alpha$.
-
-The computation for $\alpha$ is as follows:
-
-$$
-\alpha = \tan^{-1}\left(\frac{a\cos(\theta)-b}{a\sin(\theta)}\right)
-$$
-
-<p align="center">
-  <img src="docs/alpha.png">
-</p>
-
-The first state equation describes how the lateral distance error changes as the Neato moves forward.
-
-$$
-\dot{e} = v\sin(\alpha)
-$$
-
-If the Neato is perfectly parallel to the wall, then $\alpha=0$ and therefore $\dot{e} = v\sin(0) = 0$. Thus, there is no change in the lateral distance from the wall.
-
-When $\alpha \neq 0$, a component of the Neato's forward velocity points toward or away from the wall, causing the distance error to change. Therefore, for small heading errors, the small-angle approximation $\sin(\alpha) \approx \alpha$ gives $\dot{e} \approx v\alpha$.
-
-Our second state equation describes how the heading error changes with the commanded angular velocity $\omega$.
-
-$$
-\dot{\alpha} = \omega
-$$
-
-The proportional controller generates the angular velocity according to
-
-$$
-\omega = -K_e e - K_\alpha \alpha,
-$$
-
-where $K_e$ is the distance-error gain and $K_\alpha$ is the heading-error gain. Therefore,
-
-$$
-\dot{\alpha} = -K_e e - K_\alpha\alpha.
-$$
-
-Differentiating the first equation and substituting the second gives
-
-$$
-\ddot{e} = v\dot{\alpha} = -vK_e e - vK_\alpha\alpha.
-$$
-
-Since
-
-$$
-\alpha \approx \frac{\dot{e}}{v},
-$$
-
-the system can be written as
-
-$$
-\begin{aligned}
-\ddot{e} + K_\alpha\dot{e} + vK_e e &= 0, \\
-\omega_n &= \sqrt{vK_e}, \\
-\zeta &= \frac{K_\alpha}{2\sqrt{vK_e}}.
-\end{aligned}
-$$
-
-In our implementation, the distance-error gain and heading-error gain correspond to $K_e = $ `p_dist` and $K_\alpha = $ `p_angle`.
-
-The heading-error gain was selected for critical damping, $\zeta=1$:
-
-$$
-K_\alpha = 2\zeta\sqrt{vK_e}
-$$
-
-As a result, the Neato is designed to converge toward the target wall distance as quickly as possible without oscillating in our idealized model.
-
-#### 2.2.2 Proportional Control
-
-The distance error, `dist_error`, is calculated as
-
-$$
-e = d - d_{\mathrm{target}},
-$$
-
-where $d$ is the estimated perpendicular distance from the wall and $d_{\mathrm{target}}=0.3\,\mathrm{m}$.
-
-The distance error is capped before being passed to the controller
-
-$$
-e_{\mathrm{capped}} = \max\left(-e_{\max},\ \min(e_{\max},\ e)\right),
-$$
-
-keeping its response bounded. Therefore, if the two walls are not completely adjacent at a corner, the estimated distance won't suddenly change, causing the Neato to swerve in response.
-
-The controller output is
-
-$$
-\omega = -\left(K_e e_{\mathrm{capped}} + K_\alpha\alpha\right),
-$$
-
-for the right wall, matching the control law in Section 2.2.1. The resulting angular velocity, `steer`, is also clamped:
-
-$$
-\omega_{\mathrm{cmd}} = \max\left(-\omega_{\max},\ \min(\omega_{\max},\ \omega)\right),
-$$
-
-where
-
-$$
-\omega_{\max} = 1\,\mathrm{rad/s}
-$$
-
-to ensure a safe, stable, and feasible turn.
-
-Conceptually, the two feedback terms serve different purposes. The distance-error term $K_e e$ corrects the Neato's lateral position, while the heading-error term $K_\alpha\alpha$ adjusts its orientation.
-
-#### 2.2.3 Corner Handling
-
-Corner handling bypasses the proportional controller used during parallel wall following. A single LiDAR measurement, `msg.ranges[0]`, measures the distance directly in front of the Neato.
-
-A binary trigger was used to determine if the distance from the wall was under a certain threshold, $0.3\,\mathrm{m}$. However, since we did not design our Neato to turn in place, this threshold was too low for it to complete a turn before crashing into the wall. Therefore, after trial and error in simulation, a factor of 4 was chosen to amplify this threshold. If a wall was detected, we published our `/desired_cmd_vel` to turn the opposite way of `self.side`.
-
-#### 2.2.4 Visuals & Demonstration
-
-<p align="center">
-  <img src="docs/wall_follow.gif" alt="Figure 2: The wall-following behavior sped up 3x. Note the visualized wall triangle and history of wall points.">
-</p>
-<p align="center"><em>Figure 2: The wall-following behavior sped up 3x. Note the visualized wall triangle and history of wall points.</em></p>
-
-See the recorded bag at [`bags/wall_following`](bags/wall_following).
-
-### <a name="cookie-following" id="cookie-following"></a>2.3 Cookie Following
-
-The goal of this behavior was to detect a circular object of known radius $R = 0.25$ m anywhere in the 360-degree scan, publish detection events to the controller, and, when active, drive to the object and report arrival, meaning that the cookie has been "eaten." These two functions run on separate schedules: the scan callback, which searches for and reports the cookie, is always active regardless of state, while driving is active only when the node's state is active. In other words, perception and actuation are decoupled in this node.
-
-For our purposes, the "cookie" was simply the default cylinder object in the Gazebo simulator, which gave us the desired radius of $0.25$ m.
-
-#### 2.3.1 Detection Approach
-
-We employed the RANSAC (random sample consensus) algorithm for circle fitting to "find the cookie." This was a logical fit, given that the cookie could theoretically be anywhere in our view, and it uses the geometric fact that any three non-collinear points define a circle, so any set of lidar scan points can yield a potential circle candidate. Since our cookie has a known radius, $R$, we can discard any candidate whose radius differs from the expected radius. Additionally, because the cookie is convex and viewed externally, every visible point on the cookie is closer to the Neato than the center of the fitted circle; consequently, erroneous circles fitted to corners or other seemingly valid candidate points, which produce centers closer to the Neato, can be disregarded, filtering out flat and cornered surfaces. With these guidelines, the RANSAC algorithm repeatedly fits a model to a random sample, counts how many of the remaining points agree with this model, and keeps the model with the greatest number of inliers. RANSAC is robust to outliers, unlike a method such as least squares, which would be heavily skewed by them.
-
-#### 2.3.2 Architecture and Scan Callback
-
-This node subscribes to two topics and publishes to four, all of which are detailed in the table below.
-
-*Table 3: Cookie-following node topics; subscribers and publishers with their roles and when they're called.*
-
-| Topic              | Direction | Message type                | When                                                              | Role                                                                             |
-| ------------------ | --------- | --------------------------- | ----------------------------------------------------------------- | -------------------------------------------------------------------------------- |
-| `/scan`            | subscribe | `sensor_msgs/LaserScan`     | every scan <br>-<br>all states                                    | Input to RANSAC detection; this callback is what runs the node                   |
-| `/state`           | subscribe | `std_msgs/String`           | on controller broadcast                                           | Sets `is_active` true only when the state is `COOKIE_FOLLOW`                     |
-| `/cookies_found`   | publish   | `std_msgs/Int32`            | first detection of a new cookie<br>-<br>all states                | Moves the controller from `WALL_FOLLOWING` to `COOKIE_FOLLOW`                    |
-| `/cookies_eaten`   | publish   | `std_msgs/Int32`            | once per cookie<br>-<br>on arrival while active                   | Moves the controller from `COOKIE_FOLLOW` to `SQUARE_DRIVE`                      |
-| `/desired_cmd_vel` | publish   | `geometry_msgs/Twist`       | every scan <br>-<br>while active                                  | Publishes the velocity to our safety node to drive the robot after command generation |
-| `/cookie_show`     | publish   | `visualization_msgs/Marker` | every detection<br>-<br>all states<br>-<br>deleted on cookie loss | Displays an RViz2 cylinder of diameter $2R$ at the fitted center, in the lidar frame |
-
-The following table shows the parameters used in the cookie-following node and their impact on the behavior. Most of these parameters were initially chosen from a quick Google search and intuition and did not go through extensive testing to optimize performance.
-
-*Table 4: Cookie-following parameters.*
-
-| Parameter                   | Value              | Role                                                   |
-| --------------------------- | ------------------ | ------------------------------------------------------ |
-| `target_radius`             | 0.25 m             | $R$ - radius the fitted circle must match              |
-| `radius_tol`                | 0.03 m             | tolerance on the fitted circle's radius difference     |
-| `inlier_tol`                | 0.03 m             | how far off the circle a point can be and still count  |
-| `ransac_iterations`         | 200                | $K$ - iterations of the algorithm to find the circle   |
-| `min_inliers`               | 6                  | minimum support                                        |
-| `sample_radius`             | 0.5 m              | $2R$ neighborhood                                      |
-| `kp_linear`, `max_linear`   | 0.5 s⁻¹, 0.2 m/s   | linear speed control                                   |
-| `kp_angular`, `max_angular` | 0.9 s⁻¹, 6.7 rad/s | steering control                                       |
-| `stop_distance`             | 0.65 m             | arrival radius (to center)                             |
-| `max_misses`                | 10 scans           | cookie-loss buffer                                     |
-
-Everything in this behavior is executed through the `/scan` callback, which runs once per lidar message. The callback proceeds as follows:
-
-The callback first ingests and filters the 360 range readings, discarding any value outside $(r_\text{min}, r_\text{max})$, which removes anything nearer or farther than the lidar could feasibly detect (this removes both potential zeros and any `float inf` values the lidar returns when a ray does not hit anything). It then converts the remaining points from polar coordinates (given by the lidar, where the index is the angle and the value is the distance) into Cartesian coordinates via $(r_i\cos\phi_i,\ r_i\sin\phi_i)$, where $\phi_i$ is the angle (index) and $r_i$ is the range (distance value).
-
-The callback then runs the RANSAC circle fit on the list of points. This either returns the location of the fitted circle's center or reports that no circle was found.
-
-A scan with no detection does not immediately mean the cookie is gone. To keep a single bad draw from ending the following behavior, the callback counts consecutive misses and keeps the current cookie position until the miss count reaches ten. At that point, the callback declares the cookie lost, clears both `tracking` and `eaten`, and deletes the RViz marker. This was implemented because RANSAC is random, so we cannot be fully confident that a cookie has been lost after a single scan.
-
-If the fit returns a center, the callback resets the miss counter and publishes the `/cookie_show` marker at the detected center for visualization. If no track was active before this scan, this detection starts a new one. The callback sets `tracking`, increments the found count, and publishes it on `/cookies_found`; the controller uses the arrival of that message as its cue to switch from `WALL_FOLLOWING` to `COOKIE_FOLLOW`.
-
-Next, the callback transforms the center into the robot frame and computes the cookie's range $\rho$ and bearing $\beta$. What happens after that depends on whether the node is active. An inactive node stops here and publishes no velocity, so as not to disrupt the current behavior. An active node that is still more than 0.65 m from the cookie's center publishes a velocity command on `/desired_cmd_vel`. Once the robot is within 0.65 m, the node publishes a zero velocity and, if the cookie has not been eaten yet, sets `eaten` and publishes the eaten count on `/cookies_eaten`. That message sends the controller back to `SQUARE_DRIVE`, the next state broadcast turns `is_active` off, and the cycle starts again.
-
-#### 2.3.3 Algorithm
-
-On each scan, the node converts the valid ranges to Cartesian points in the lidar frame and then performs $K = 200$ iterations of the following logic. In each iteration, it selects a random point $p_1$ and collects all points (by iterating through the point list) within $2R$ of it; this is the local neighborhood of the point. If the neighborhood contains fewer than two points, the iteration is skipped. It then selects $p_2$ and $p_3$ at random from the neighborhood and fits the circumcircle of the three points. This candidate is rejected if the points are nearly collinear (explained in the next section), if $|r - R| > 0.03$ m, or if the center is not farther from the sensor than $p_1$. Otherwise, the node counts the inliers, defined as scan points whose distance to the center lies within 0.03 m of $r$ (essentially, the other points on the circle), and stores this candidate as the best fit if it has the most inliers (a fit must have at least six to be valid). After all iterations, the node reports the best center (in the case of a tie, it keeps the earlier fit) or no detection.
-
-#### 2.3.4 Circumcircle
-
-Given points $(x_i, y_i)$, $i = 1, 2, 3$, we use the circumcircle formula to determine the center of the proposed circle as follows:
-
-```math
-D = 2\left[x_1(y_2 - y_3) + x_2(y_3 - y_1) + x_3(y_1 - y_2)\right],
+```
+for every update:
+    predict:   move every particle by the odometry change, plus noise
+    correct:   score every particle by how well the scan lines up with the map from its pose
+    resample:  build a new cloud where high-weight particles get more copies
 ```
 
-```math
-c_x = \frac{\sum_i (x_i^2 + y_i^2)(y_{i+1} - y_{i+2})}{D}, \qquad c_y = \frac{\sum_i (x_i^2 + y_i^2)(x_{i+2} - x_{i+1})}{D},
+Keeping a cloud instead of a single estimate has the advantage of holding several possibilities, or pose guesses, at a time. If, for example, two hallways looked identical to the lidar, the filter could keep a group of particles between both points until more information would arrive that could differentiate the two, unlike single possibility algorithms, like a Kalman filter. With this, the cost of computation is far higher. This required a focus on computational efficiency in our work, as described later. 
+
+Our implementation follows the particle filter and Monte Carlo Localization algorithms described in *Probabilistic Robotics* by Thrun, Burgard, and Fox (ch. 4 and ch. 8), visualized on a high level below in Figure 1.
+
+<p align="center"> <img src="docs/mcl_loop.png" alt="The predict, correct, resample loop"> </p> <p align="center"><em>Figure 1: The MCL loop. [TODO: make this diagram]</em></p>
+
+### 1.2 Architecture
+
+#### 1.2.1 Topics, TF Frames, and Threading
+
+The node subscribes to the laser scan and to RViz's 2D Pose Estimate tool, publishes the particle cloud for visualization, and broadcasts a single transform, `map` to `odom`, which is how ROS learns where the filter thinks the robot is. Table 1 lists every topic and transform the node interacts with.
+
+*Table 1: Particle filter node topics and TF transforms, with when each one is used and its role in the filter.*
+
+| Topic / TF Frame | Direction | Message / Transform Type | When | Role |
+| :--- | :--- | :--- | :--- | :--- |
+| `/scan` | subscribe | `sensor_msgs/LaserScan` | every scan (~7.7 Hz in the bags) | Stores the newest scan in `scan_to_process` if the filter is free, and updates `last_scan_timestamp` |
+| `/initialpose` | subscribe | `geometry_msgs/PoseWithCovarianceStamped` | on RViz 2D Pose Estimate click | Re-initializes the cloud as a Gaussian around the clicked pose |
+| `/particle_cloud` | publish | `nav2_msgs/ParticleCloud` | after the cloud is created or updated | Displays every particle's pose and weight in RViz |
+| `odom` -> `base_footprint` | TF lookup | `geometry_msgs/TransformStamped` | every `run_loop` tick | Retrieves the robot's odometry pose at the exact time the scan was taken |
+| `base_footprint` -> `rplidar_link` | TF lookup | `geometry_msgs/TransformStamped` | per scan | Provides the lidar's (x, y) mounting offset on the robot |
+| `map` -> `odom` | TF broadcast | `geometry_msgs/TransformStamped` | 20 Hz timer (+0.1 s postdated) | Corrects odometry drift by placing the odom frame on the map |
+
+The particle cloud is published with `qos_profile_sensor_data`, which uses best effort reliability. Since the cloud is purely a visualization topic that gets replaced per update, the message being dropped, where best effort will not guarantee every message being sent or retransmitted if lost, is largely inconsequential. 
+
+The filter itself does not run inside the scan callback. `scan_received` only stores the newest scan in `scan_to_process`only once the previous scan has been handled, while `loop_wrapper` calls `run_loop` repeatedly on a separate daemon thread. This intentional decoupling prevents a slow filter update from blocking ROS callbacks, meaning scans that arrive while the filter is busy are discarded rather than accumulating in a queue and building delay in communication. Originally, `loop_wrapper` slept for 0.1 s between calls, so a scan that arrived immediately after a check could wait up to 0.1 s before `run_loop` processed it. Reducing the sleep to 0.01 s lowered the median lag over the first 14 s of the bag from approximately 0.21 s to 0.15 s (Section 3.2).
+
+A 20 Hz timer, `pub_latest_transform`, re-broadcasts the latest `map` to `odom` transform  with a hardcoded time stamped 0.1 s after the last scan's timestamp. Postdating, or adding time to the original timestamp, the transform prevents TF extrapolation errors in RViz between laser updates, and deriving the stamp from the scan rather than the wall clock keeps every node on bag time during playback so they are in unison.
+
+One minor tweak for performance was modifying when the particle cloud is published. Initially, the cloud was published after every scan; however, publishing several thousand particles required 55 to 72 ms, which exceeded the cost of the filter update itself, and the cloud only changes when the filter updates. `publish_particles` is now called only after the cloud is created or updated.
+
+Because the bags were recorded on a Turtlebot 4 rather than a Neato, the sensor setup differs from the gauntlet simulation  and previous project in three main ways:
+
+1. The bag publishes both `odom` -> `base_link` and `odom` -> `base_footprint`. The filter tracks the robot through `base_footprint`, but the lidar is attached to `base_link` by a static transform, so `get_laser_offset` resolves the lidar's position through that chain. The resulting offset of about 4 mm is negligible next to the 0.03 m map cell, though this is good practice as the Neato has a non-negligible offset at this resolution.
+2. `rplidar_link` is rotated by $\pi/2$ relative to the robot, while the Neato's laser faces backwards, a rotation of $\pi$. `convert_scan_to_polar_in_robot_frame` adds this yaw to every beam angle (Section 2.3.1). If it were omitted, every scan would be rotated relative to the robot, and the filter would favor particles with the wrong heading. One of our unit tests checks this on a Neato scan (Section 4.2).
+3.  The rplidar returns 720 beams per scan, about twice the Neato's 361. Since scoring cost grows with the number of beams, this is the main reason for subsampling with `beam_step` (Section 2.3.1).
+
+<p align="center"> <img src="docs/tf_tree.png" alt="TF tree"> </p> <p align="center"><em>Figure 2: TF tree during bag playback, map -> odom -> base_footprint, with the lidar attached through base_link. [TODO: generate with ros2 run tf2_tools view_frames]</em></p>
+
+#### 1.2.2 Filter Parameters
+
+Table 2 below lists every ROS2 parameter declared in `__init__`, its function, and how its value was determined. Since they are declared as ROS parameters, each can be overridden at launch with `--ros-args -p name:=value` for ease of use.
+
+*Table 2: Particle filter parameters, their defaults, tuning effects, and how each value was chosen.*
+
+| Parameter                                   | Value                | Role & Tuning Effect                                                                                                                              | How It Was Chosen                                                                  |
+| :------------------------------------------ | :------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------ | :--------------------------------------------------------------------------------- |
+| `n_particles`                               | 6000 particles       | More particles cover the map more densely, improving the reliability of global localization, at the cost of computation on every update           | Lag measurements: 10000 localizes more reliably but exceeds the ~0.13 s lag target |
+| `d_thresh`, `a_thresh`                      | 0.05 m, $\pi/24$ rad | Distance or rotation required before the filter updates; smaller values produce more frequent updates and more frequent resampling                | [TODO]                                                                             |
+| `random_resample`                           | 0.2                  | Fraction of particles respawned uniformly over the map on every resample, allowing recovery if the filter converges on the wrong location         | [TODO]                                                                             |
+| `resample_xy_sigma`, `resample_theta_sigma` | 0.1 m, 0.1 rad       | Standard deviation of the noise added to each resampled copy; tighter than the initial spread, since resampled particles have already scored well | [TODO]                                                                             |
+| `sigma_hit`                                 | 0.3 m                | Width of the blur around walls; a wider blur tolerates more sensor and map error at the cost of precision                                         | [TODO]                                                                             |
+| `min_likelihood`                            | 0.01                 | Lower bound on every beam's probability, so a single erroneous reading cannot eliminate a good particle                                           | [TODO]                                                                             |
+| `log_scale`                                 | 20                   | Divisor on each particle's summed log score, so ~240 correlated beams are not treated as "240 independent measurements" (Section 2.3.3)           | Measured weight concentration on a real scan, followed by testing on the bag       |
+| `beam_step`                                 | 3                    | Uses every third beam (720 -> 240) to reduce update time                                                                                          | Computational speed                                                                |
+| `init_xy_sigma`, `init_theta_sigma`         | 0.3 m, 0.3 rad       | Spread of the initial cloud around a 2D Pose Estimate                                                                                             | [TODO]                                                                             |
+| `odom_trans_noise`, `odom_rot_noise`        | 0.1 m/m, 0.1 rad/rad | Motion noise as a fraction of distance driven and angle turned                                                                                    | [TODO]                                                                             |
+| `cluster_radius`                            | 1.0 m                | Radius around the best particle within which particles are averaged into the pose estimate                                                        | [TODO]                                                                             |
+
+Many of these values have a particular interplay with other functionality of the system - for example, modifying `random_resample` translates to a modification in many of the standard deviations of other distributions and the total particle count. With `random_resample` at 0.2, every update places 1200 of the 6000 particles at random over roughly 1371 m$^2$ of free space, a density of only about 0.9 particles per m$^2$. Once the filter has localized, almost none of these land near the robot, so in practice roughly 4800 particles perform the tracking. 
+
+### 1.3 Data: Bag Files and Map
+
+*Table 3: Bag files used for development and testing.*
+
+| Bag | Length | Topics | Notes |
+| :--- | :--- | :--- | :--- |
+| [`macfirst_floor_take_1`](bags/macfirst_floor_take_1) | ~93 s | `/scan` (~7.7 Hz, 720 beams), `/tf` (~20 Hz), `/tf_static`, `/odom`, `/cmd_vel` | A lag spike at ~58.9 s appears in every run, indicating it originates in the bag |
+| [`macfirst_floor_take_2`](bags/macfirst_floor_take_2) | ~46 s | same as take 1 | The robot is stationary for the first ~11 s |
+
+The map, [`maps/mac_1st_floor_final.yaml`](maps/mac_1st_floor_final.yaml), has a resolution of 0.03 m per cell and approximately 1371 m$^2$ of free space. Consequently, the resulting particle density is low for our selected 6000 particles, amounting to only about 4.4 per m$^2$, which is a large component of the difficulty of global localization from a random cloud (Section 2.1.2). Unknown (gray) cells are treated as empty when building the likelihood field, so any surface the lidar detects in an unmapped region scores the same as open space. Though the map was developed via SLAM tools on an earlier run inside that same bag recording, there still exist tiny scaling differences in the way that the points are interpreted during SLAM to convert to the map. For example, areas that are explored more densely lead to thinner walls as more points exist there and can cleanly extract some depth, similar to the irregular thickness of obstacle walls on the Neato Gauntlet Word. Thus, the scan may not exactly line up 1-1 with the map data, though in our testing this was negligble in delivering a solid pose extraction algorithm.
+
+[TODO: add bags/README.md describing each bag's route and how to play it with]
+
+## 2. Core Localization Subsystems
+
+This section describes the five stages of the filter in the order they execute. For each stage, we cover its purpose, implementation, underlying math, limitations, and related unit tests.
+
+### <a name="map-and-init" id="map-and-init"></a>2.1 Map Representation, Likelihood Field, & Initialization
+
+#### 2.1.1 Precomputing the Likelihood Field
+
+Scoring a particle requires determining, for every laser beam, whether that beam would have terminated on a wall had the robot been at the particle's pose. Tracing every beam through the map on every update would be prohibitively slow, so this computation is performed once, in advance, for every cell. `build_likelihood_field` converts the map into a grid in which each cell stores the likelihood of a beam ending there. Scoring then reduces to a lookup.
+
+The map arrives as `m.data`, a flat list in which 100 denotes a wall, 0 free space, and -1 unknown, ordered row by row from the map's bottom-left origin. Reshaping it to `(height, width)` produces rows of y and columns of x, and transposing it allows indexing as `grid[x_cell, y_cell]`, consistent with the (x, y) convention used throughout the code (and aligned with developer preference). Walls are then marked with `(grid > 0).astype(float)`, which assigns 0 to both free and unknown cells, and blurred with `gaussian_filter` using a standard deviation of `sigma_hit / map_resolution` cells. With `mode="constant"`, everything beyond the edge of the map is treated as empty.
+
+The blurred field must be scaled so that a wall reads as approximately 1.0. Our first version accomplished this by dividing by `np.max(blurred)`, the brightest value on the entire map. This proved to be a significant flaw. One property of a gaussian blur with our kernel size is that, given walls of uneven thickness, the multi-pixel thick walls would influence the nearby pixels twice as much, leading to more intense brightness for thicker walls. Consequently, only thick walls and corners reach the maximum, so thin walls were scaled far lower: on the MAC map, the median wall cell was only about 0.38. A beam landing directly on a thin wall therefore scored lower than a beam landing just near a thick one, and earlier in our unit tests a pose 20 cm from the truth outscored the true pose (`test_true_pose_scores_best` and `test_a_few_bad_beams_dont_change_the_winner` both failed).
+
+Blurring a line one cell thick with a Gaussian of standard deviation $s$ cells distributes its single unit of intensity across the entire kernel, so its peak is approximately
+
+$$
+\text{peak}_{\text{thin}} \approx \frac{1}{\sqrt{2\pi}\, s},
+$$
+
+which is only about 0.04 at $s = 10$ cells. The edge of a very thick wall, by contrast, reaches 0.5, and the interior of a large solid region reaches 1.0. Before scaling, a wall's intensity depends on how thickly it is drawn in the map, which is unrelated to whether a beam would strike it.
+
+Our fix was to scale by a typical wall rather than the brightest one, and to cap the result at 1:
+
+```python
+self.likelihood_field = np.minimum(blurred / np.median(blurred[walls > 0]), 1.0)
 ```
 
-The magnitude $|D|$ equals four times the area of the triangle and approaches zero for collinear points. We therefore reject candidates with $|D| < 10^{-4}$ m² to prevent flat walls from producing circles of very large radius.
+A typical wall now reads as 1.0, thicker walls saturate at 1.0, and both previously failing tests pass. The cap does carry a cost: near thick walls and corners the field is uniformly 1.0, so slightly misaligned particles in those regions receive identical scores.
 
-#### 2.3.5 Local Sampling
+<p align="center"> <img src="docs/likelihood_field.png" alt="Likelihood field before and after the median fix"> </p> <p align="center"><em>Figure 3: The likelihood field before (left) and after (right) scaling by the median wall value. Note how the thin walls go from dim to fully bright. [TODO: make with view_likelihood_field.py]</em></p>
 
-Sampling $p_2$ and $p_3$ from the local neighborhood greatly raises the probability of drawing three cookie points in a single iteration. This decision emerged after we realized that uniform sampling across the entire scan, with each point drawn independently, led to very low success rates in finding the circle, even though the data was qualitatively clean. The following analysis shows the extent to which local sampling helps. Let $N$ be the number of valid scan points and $n_c$ the number that lie on the cookie. Without local sampling, the probability that all three points lie on the cookie is approximately $(n_c/N)^3$; with local sampling over a $2R$ neighborhood, it rises to approximately $n_c/N$, since the other two points are essentially guaranteed to lie on the cookie if the first point does. In other words, the difference is between gambling once and gambling three times.
+We also considered an alternative construction. *Probabilistic Robotics* (ch. 6.4) describes a likelihood field derived from each cell's distance to the nearest wall, which is the approach ROS AMCL uses (`scipy.ndimage.distance_transform_edt` computes it), and which assigns every wall exactly 1.0 by construction. [TODO: say why you kept the blur, e.g. it was your own approach, it was already working with the fix, you wanted to understand the problem instead of swapping methods.] We had explored the distance transform early in development in `test2.py`.
 
-Local sampling assumes that no other surface lies within $2R = 0.5$ m of the cookie. This held in our testing but is not always true: when the cookie is near a wall, the two share a neighborhood, and the success rate approaches that of the uniform case. The radius $2R$ is the smallest neighborhood guaranteed to contain the entire cookie from any point on it. Another advantage of this approach is that, by using Euclidean distance rather than iterating over point indices, we handle the scan's wrap-around from 359° to 0° without special cases.
+To look up a point $(x, y)$ in the field, `world_to_cell` converts it from meters to cell indices:
 
-#### 2.3.6 Detection Range and Noise Sensitivity
+$$
+i_x = \left\lfloor \frac{x - x_{\text{origin}}}{\text{resolution}} \right\rfloor, \qquad i_y = \left\lfloor \frac{y - y_{\text{origin}}}{\text{resolution}} \right\rfloor
+$$
 
-The farther away the circle is, the fewer lidar points land on it. Intuitively, the lidar has a 1-degree angular resolution, so if you picture 360 rays spaced 1 degree apart extending from the lidar, neighboring rays are closer together on a circle 1 m away than on a circle 5 m away. Mathematically, a circle of radius $R$ whose center lies at distance $\rho$ subtends an angle $\alpha = 2\arcsin(R/\rho)$ as seen by the lidar on the Neato body. This can be derived from the geometry of the lidar and the circle. The two outermost points on the circle lie on the tangent rays from the lidar. Since every tangent line meets a circle at a right angle to the radius, the cookie's center, the tangent point, and the lidar form a right triangle. The hypotenuse is $\rho$, the distance from the lidar to the center of the circle, and the side opposite the angle at the lidar is $R$, from the center to the tangent point. This gives $\sin(\alpha/2) = R/\rho$; the angle is halved because this right triangle covers only half of the cookie, and by symmetry the full subtended angle is $\alpha = 2\arcsin(R/\rho)$. This yields a mapping from the distance of the circle to the maximum number of points that can lie on it, shown below.
+and additionally reports whether the point lies on the map. It operates identically on a single point or on entire NumPy arrays of points, which the laser update relies on.
 
-*Table 5: Maximum cookie points versus distance. The drop-off is steepest at close range but continues to matter at every distance.*
+Precomputation represents a clear tradeoff: the blur runs once at startup over the whole map, whereas scoring performs roughly 6000 particles × 240 beams of lookups on every update. The same function also stores the indices of every free cell (`np.nonzero(map_array == 0)`), so random particles can be drawn directly from free space instead of by repeated trial.
 
-| $\rho$ (m) | 1 | 2 | 3 | 4 |
-|---|---|---|---|---|
-| $n_c$ (points) | 29 | 14 | 9 | 7 |
+#### 2.1.2 Particle Representation & Cloud Initialization
 
-In retrospect, the six-inlier requirement therefore limits detection to $\rho \le R/\sin 3^\circ$ (from the previous formula), which is about 4.8 m; however, this did not greatly impact the behavior in practice.
+The cloud is stored as an N × 3 NumPy array with one row $[x\ (\mathrm{m}),\ y\ (\mathrm{m}),\ \theta\ (\mathrm{rad})]$ per particle, and rows are converted to `Particle` objects only when publishing to RViz for ease of use. Representing the cloud as a single array is what allows every other stage to update all particles in one operation.
 
-Conversely, closely spaced sample points make the fitted radius highly susceptible to noise. If the chord $c$, defined as the straight line from the leftmost to the rightmost point on the visible arc, were on the scale of roughly 0.1 m, then the sagitta $s$, the perpendicular distance from the chord's midpoint to the arc, would be around 5 mm, given the approximation $s \approx c^2/(8R)$. A sagitta this small is comparable to the lidar's range noise, so the fitted radius becomes essentially random; the code accounts for this with the radius-tolerance rejection. *The geometric terms used here refer to the minor arc defined by the chord and sagitta, since the lidar scan cannot see beyond a semicircle of the cookie.*
+The cloud can be initialized in two ways:
 
-#### 2.3.7 Frame Transform
- 
-RANSAC runs in the lidar frame. Based on the output of `tf2_echo base_link base_laser_link`, the lidar is rotated by $\pi$ about $z$ and offset by $-0.084$ m in $x$ relative to `base_link`, which is our reference frame for the Neato. A rotation by $\pi$ negates both coordinates, so the center in the robot frame is
- 
-```math
-\begin{bmatrix} x_b \\ y_b \end{bmatrix} = \begin{bmatrix} -0.084 - c_x \\ -c_y \end{bmatrix}, \qquad \rho = \sqrt{x_b^2 + y_b^2}, \qquad \beta = \mathrm{atan2}(y_b, x_b),
+[TODO: talk more about this section]
+[TODO: include a table that shows how the distribution would matter in map scale prob]
+
+### <a name="motion-model" id="motion-model"></a>2.2 Odometry Motion Model
+
+#### 2.2.1 Update Trigger Thresholds
+
+The filter updates only when `moved_far_enough_to_update` determines that the robot has translated more than `d_thresh` (0.05 m) or rotated more than `a_thresh` (7.5 degrees) since the previous update. Updating on every scan while the robot is stationary would repeatedly resample the same information, and the noise added at each resample would progressively spread the cloud, or collapse it onto whichever particle scored highest, without any new evidence about the robot's location. With this naive implementation, all of these checks run independently, meaning that diagonal movement could travel further along this check without triggering it. 
+
+#### 2.2.2 Coordinate Frame Rotation & Scaled Gaussian Noise
+
+The odometry change $(\Delta x_{\text{odom}}, \Delta y_{\text{odom}}, \Delta\theta)$ is measured in the odom frame and cannot be added directly to each particle's position, because each particle has its own heading $\theta_i$ and the odom frame is rotated relative to the map frame by an unknown amount. If odometry reports a 1 m displacement in +y, the physical meaning is that the robot drove 1 m forward, and a particle facing +x on the map should therefore move 1 m in +x.
+
+`update_particles_with_odom` accordingly proceeds in two steps. First, it rotates the odometry change by the robot's previous odometry heading $\theta_{\text{old}}$ into the robot's body frame, expressed as forward, left, and turn components:
+
+$$
+\text{forward} = \cos(\theta_{\text{old}})\Delta x + \sin(\theta_{\text{old}})\Delta y
+$$
+
+$$
+\text{left} = -\sin(\theta_{\text{old}})\Delta x + \cos(\theta_{\text{old}})\Delta y
+$$
+
+$$
+\text{turn} = \text{angle\_diff}(\theta_{\text{new}}, \theta_{\text{old}})
+$$
+
+These expressions follow from projecting the displacement onto the robot's own axes. At heading $\theta_{\text{old}}$, the robot's forward axis in the odom frame is the unit vector $\hat{u}_f = (\cos\theta_{\text{old}}, \sin\theta_{\text{old}})$, and its left axis, obtained by rotating $\hat{u}_f$ by $+90$ degrees, is $\hat{u}_l = (-\sin\theta_{\text{old}}, \cos\theta_{\text{old}})$. The component of the displacement $(\Delta x, \Delta y)$ along each axis is its dot product with that unit vector, which yields the forward and left equations above. Equivalently, the two equations apply the inverse of the 2D rotation matrix, which for a rotation is its transpose:
+
+$$
+\begin{bmatrix} \text{forward} \\ \text{left} \end{bmatrix} = R(\theta_{\text{old}})^{T} \begin{bmatrix} \Delta x \\ \Delta y \end{bmatrix}, \qquad R(\theta) = \begin{bmatrix} \cos\theta & -\sin\theta \\ \sin\theta & \cos\theta \end{bmatrix}
+$$
+
+$R(\theta_{\text{old}})$ maps a vector from the robot's frame into the odom frame, so its transpose maps the odom displacement back into the robot's frame. The result no longer depends on how the odom frame is oriented, which is what allows the same motion to be applied to every particle. Using $\theta_{\text{old}}$ treats the motion as if it occurred entirely at the starting heading; since updates occur every 5 cm or 7.5 degrees, the error from ignoring the heading change during the step is small. The turn component needs no projection because a rotation about the vertical axis is the same in every frame, but its difference is computed with `angle_diff`, which wraps the result to $[-\pi, \pi]$ so that crossing $\pm 180°$ is not mistaken for a nearly full rotation.
+
+It then adds zero-mean Gaussian noise to each component, with standard deviations proportional to the distance traveled, $d = \sqrt{\text{forward}^2 + \text{left}^2}$, and the angle turned, $|\text{turn}|$:
+
+$$
+\hat{f} = \text{forward} + \mathcal{N}(0,\ k_t d), \qquad \hat{l} = \text{left} + \mathcal{N}(0,\ k_t d), \qquad \hat{\tau} = \text{turn} + \mathcal{N}(0,\ k_r |\text{turn}|),
+$$
+
+where $k_t$ is `odom_trans_noise` and $k_r$ is `odom_rot_noise`. Scaling the noise with motion reflects how odometry error arises in practice: wheel slip accumulates with distance, so a long move is less certain than a short one, and a stationary robot should not scatter its particles. Finally, each particle applies the noisy motion along its own heading:
+
+$$
+x_i' = x_i + \hat{f}\cos(\theta_i) - \hat{l}\sin(\theta_i), \qquad y_i' = y_i + \hat{f}\sin(\theta_i) + \hat{l}\cos(\theta_i), \qquad \theta_i' = \theta_i + \hat{\tau}
+$$
+
+These operations are applied to the entire cloud at once. Passing n to `np.random.normal(0, sigma, n)` draws an independent noise sample for each particle, and entire columns of `particle_cloud` are updated. The helper `angle_normalize` relies on `math.atan2`, which accepts only scalars, so the new headings are instead wrapped to $[-\pi, \pi]$ via `np.arctan2(np.sin(theta), np.cos(theta))` over the whole column.
+
+ Our model is relatively simple, with a single translational and a single rotational noise term. Its assumption is that rotation in place introduces no positional noise. A physical robot rotating in place likely experiences some translation as well, although we did not measure its magnitude, yet still deem it negligible. 
+
+#### 2.2.4 Testing & Limitations
+
+Sign errors and frame mix-ups are both easy to introduce in the motion model and difficult to detect in RViz, so most of the tests disable noise and verify exact values. `test_forward_means_forward_for_each_particle` applies the same 1 m motion (facing +y in the odom frame) to particles facing four different directions, each of which must move 1 m along its own heading; `test_sideways_drift` verifies the lateral term; and `test_turning_across_180_degrees` confirms that a change from 3.0 rad to -3.0 rad is interpreted as a small left turn of about 0.28 rad rather than a turn of -6 rad. Two additional tests verify that noise spreads particles without biasing their mean and that a stationary robot does not scatter them.
+
+Regarding limitations, the noise constants are fixed across robots and environments, and they were set by [TODO:]. They are also coupled to `d_thresh`, since larger steps between updates produce larger noise per update.
+
+### <a name="sensor-model" id="sensor-model"></a>2.3 Laser Sensor Model & Log-Likelihood Scoring
+
+#### 2.3.1 Beam Subsampling & Sensor Frame Transform
+
+Before scoring, `run_loop` discards any beam outside the laser's valid range, $[\text{range\_min}, \text{range\_max})$, and retains every `beam_step`-th beam, reducing the 720 beams to approximately 240. At this point, no additional filtering is required as the zero and inf reading cannot bypass the range check.
+
+By reducing the coverage via subsampling, there is less information being captured. The rplidar's beams are spaced 0.5 degrees apart, and the gap between adjacent beam endpoints increases linearly with range. Nearby walls receive many beams while distant walls receive only a few, meaning nearby walls dominate the score. This is partially desirable, since close-range readings are more accurate; however, in a large open room the distant walls carry the most information about the robot's position, so the beam distribution is important. Despite this, our beam selection is not intelligent and naively iterates uniformly across the indices. 
+
+Each beam $k$ arrives as a range $r_k$ and an angle $\phi_k$, and it must be expressed in the map frame before it can be looked up in the likelihood field. This happens in two steps. First, the beam is converted to a Cartesian point in the robot's frame. `convert_scan_to_polar_in_robot_frame()` already adds the laser's mounting yaw to every angle ($\pi/2$ for the Turtlebot's `rplidar_link`), so only the laser's translational offset $(o_x, o_y)$ from `get_laser_offset()` remains to be added:
+
+$$
+b_{x,k} = o_x + r_k\cos\phi_k, \qquad b_{y,k} = o_y + r_k\sin\phi_k \tag{11}
+$$
+
+Second, the point is placed on the map from the pose of each particle $i$, $[x_i, y_i, \theta_i]$, by rotating it with $R(\theta_i)$ from Eq. (7) and then shifting it by the particle's position:
+
+$$
+\begin{bmatrix} e_{x,ik} \\ e_{y,ik} \end{bmatrix} = \begin{bmatrix} x_i \\ y_i \end{bmatrix} + R(\theta_i) \begin{bmatrix} b_{x,k} \\ b_{y,k} \end{bmatrix} \tag{12}
+$$
+
+where $(e_{x,ik}, e_{y,ik})$ is the endpoint of beam $k$ as seen from particle $i$. This is the same rotation used in the motion model, applied in the opposite direction: in Eq. (7), $R(\theta_{\text{old}})^{T}$ moves an odometry displacement into the robot's frame, while in Eq. (12), $R(\theta_i)$ moves a point in the robot's frame out onto the map.
+
+Eq. (12) has to be evaluated for every particle and every beam, which at N = 6000 particles and B = 240 beams is roughly 1.4 million endpoints per update. Rather than looping, we use NumPy broadcasting. The particle columns are sliced with `0:1` (e.g., `particle_cloud[:, 0:1]`) so that they keep the shape (N, 1) instead of collapsing to (N,), while `beam_x` and `beam_y` have shape (B,). When an (N, 1) array is combined with a (B,) array, NumPy stretches each one along the other's axis, producing an (N, B) array in which row $i$ holds every beam endpoint for particle $i$. A single call to `world_to_cell()` and a single indexing operation into `likelihood_field` then score every beam of every particle at once. The tradeoff is memory, since each intermediate (N, B) array holds about 1.4 million 64-bit floats, or roughly 11.5 MB.
+
+#### 2.3.2 Log-Probability Summation & Preventing Underflow
+
+Each beam is first assigned a probability of `min_likelihood` (0.01), and beams that land on the map then add the value of the likelihood field $L$ at their endpoint. This floor protects good particles from a single unexpected reading. Without it, one beam landing on a 0.0 cell, for instance because a person walked past the robot or a chair was sitting somewhere the map does not show, would have a probability of 0, and since the beam probabilities are multiplied together, that one beam would set the weight of an otherwise well-aligned particle to 0.
+
+Assuming each beam is independent, the likelihood of the full scan from particle $i$ is the product of its beam probabilities. We chose a product over an average because an average is too forgiving: a particle with half of its beams in open space can still reach a reasonable average, while a product penalizes every misaligned beam. Multiplying several hundred values less than 1, however, quickly underflows, so we instead sum their logarithms. Including the `log_scale` divisor $T$ (Section 2.3.3), the log weight of particle $i$ is:
+
+$$
+\ell_i = \frac{1}{T} \sum_{k=1}^{B} \ln\left(p_{\min} + L(e_{x,ik}, e_{y,ik})\right) \tag{13}
+$$
+
+where $p_{\min}$ is `min_likelihood` and $L$ is taken as 0 for endpoints that fall off the map. In code, this is a single `np.sum(np.log(beam_probs), axis=1)` over the (N, B) array of beam probabilities, where `axis=1` sums across each row to give one score per particle. To convert back to a weight, the largest log weight is subtracted before exponentiating:
+
+$$
+w_i = \exp\left(\ell_i - \max_j \ell_j\right) \tag{14}
+$$
+
+The shift is necessary because of how large these sums become. Each beam contributes between $\ln(0.01) = -4.6$ for a complete miss and $\ln(1.01) \approx 0.01$ for a beam directly on a wall, so at $T = 1$ a particle whose ~240 beams all miss sums to roughly $-1105$. A 64-bit float, meanwhile, rounds `exp()` of anything below about $-745$ to exactly 0.0. Without the shift, every poorly aligned particle, and occasionally every particle in the cloud, would receive a weight of 0, and normalizing would then divide by zero. Subtracting the maximum gives the best particle a weight of $\exp(0) = 1$ and leaves the ratio between any two weights unchanged, since $e^{\ell_i - c} / e^{\ell_j - c} = e^{\ell_i - \ell_j}$ for any constant $c$.
+
+#### 2.3.3 Overconfidence & log_scale
+
+Early on, global localization succeeded on some runs and failed on others with identical code. Measuring the weights showed why: on a real gauntlet scan (119 beams), one update on a random cloud of 3000 particles gave a single particle 100% of the weight, for an effective sample size, $\text{ESS} = 1/\sum_i w_i^2$, of 1.0 out of 3000. The best and tenth-best particles differed by only about 0.36 log units per beam, but over 119 beams this compounds to a weight ratio of roughly $e^{-42}$. The cause is the independence assumption behind Eq. (13): neighboring beams usually strike the same wall, so counting each one as separate evidence makes the filter far too confident (*Probabilistic Robotics*, ch. 6).
+
+Dividing the summed log score by `log_scale`, $T$, raises each likelihood to the power $1/T$, which is roughly equivalent to treating the 240 beams as $240/T$ independent measurements (about 12 at T = 20) and softens the penalty for a complete miss from a factor of 0.01 to $0.01^{1/20} \approx 0.79$. On the same scan, T = 20 raised the ESS to about 42, while a cloud already near the truth stayed concentrated. [TODO: describe how you settled on 20 on the bag.] The `weights_to_use` debug log tracks this during a run (Figure 4).
+
+<p align="center"> <img src="docs/weights_to_use.png" alt="weights_to_use over a run"> </p> <p align="center"><em>Figure 4: weights_to_use over a run of take 1 for log_scale = 1 and log_scale = 20. [TODO: plot from the debug logs]</em></p>
+
+Before adopting `log_scale`, we also tried replacing the product with the sum of cubed beam probabilities from Nav2 AMCL's [`likelihood_field_model.cpp`](https://github.com/ros-navigation/navigation2/blob/main/nav2_amcl/src/sensors/laser/likelihood_field_model.cpp), which its source describes as an "ad-hoc weighting scheme." This overcorrected: the weights became nearly uniform (an ESS of about 2500 out of 3000), so each update pulled a nearby cloud only about 2 cm toward the truth, less than the noise and random particles added at every resample, and the filter lost track halfway through the bag. We assume AMCL avoids this because, by default, it adds neither. The experiment did surface the thin wall problem in Section 2.1.1, since the sum of cubes failed two unit tests with the original max-normalized field.
+
+#### 2.3.4 Limitations
+
+[TODO]
+
+### <a name="pose-estimate" id="pose-estimate"></a>2.4 Pose Estimation & TF Correction
+
+#### 2.4.1 Clustering & Circular Mean
+
+[TODO]
+
+#### 2.4.2 The map to odom Transform
+
+[TODO]
+
+<p align="center"> <img src="docs/map_odom.png" alt="map, odom, and robot frames"> </p> <p align="center"><em>Figure 5: The map, odom, and robot frames in the worked example above. [TODO: draw]</em></p>
+
+### <a name="resampling" id="resampling"></a>2.5 Particle Resampling
+
+#### 2.5.1 Random Exploration and Weighted Copies
+
+[TODO: implement]
+
+#### 2.5.2 Testing & Limitations
+
+[TODO]
+
+## 3. System Integration, Performance, & Results
+
+### 3.1 End-to-End Flow of run_loop
+
+Each pass of `run_loop()` first checks whether a scan is waiting in `scan_to_process`. If one is, `get_matching_odom_pose()` asks TF for the robot's odometry pose at the exact time the scan was taken. If that transform is not available yet, `run_loop()` returns and tries again on the next pass, and if the scan is older than everything in the TF buffer, it can never be matched and is dropped. Once matched, the scan is converted to polar coordinates in the robot's frame and subsampled. What happens next depends on the state of the filter: the first scan sets the odometry baseline, the second creates the particle cloud, and every scan after that triggers a full update whenever the robot has moved far enough:
+
 ```
- 
-where $\beta$ is the bearing. This initially caused an issue with the debugging visualization: the marker always appeared flipped relative to the lidar points, even though the actuation logic worked correctly. This was because the rotation of the lidar by $\pi$ was negated by the fact that the first scan, as detailed within `msg.angle_min` from the Neato documentation on the class site, is recorded as $-\pi$.
- 
-#### 2.3.8 Control
- 
-The linear and angular velocity commands are as follows:
- 
-```math
-v = \min(0.2,\; 0.5\,\rho), \qquad \omega = \mathrm{clamp}(0.9\,\beta,\ \pm 6.7),
+update_particles_with_odom()  ->  update_particles_with_laser()  ->  update_robot_pose()  ->  resample_particles()  ->  publish_particles()
 ```
 
-and otherwise the node stops the robot. The control law is essentially constant-speed pursuit with an added proportional steering term. Looking back, we realize that the linear speed term always saturates for $\rho > 0.4$ m, and the robot only drives when $\rho > 0.65$ m, so the speed is effectively a constant 0.2 m/s throughout the state. Since $|\beta| \le \pi$, the commanded angular speed never exceeds $0.9\pi \approx 2.83$ rad/s, so the 6.7 rad/s clamp never engages in practice. The 0.65 m stopping distance is measured to the cookie's center, which leaves 0.40 m between the Neato and the cookie's surface.
+<p align="center"> <img src="docs/run_loop.png" alt="run_loop flowchart"> </p> <p align="center"><em>Figure 6: Flowchart of run_loop. [TODO: make]</em></p>
 
-#### 2.3.9 Limitations
+### 3.2 Measuring and Reducing Lag
 
-One of the main limitations of this implementation is that the neighborhood search is computationally expensive, as it iterates over every point. NumPy vectorization could make this more efficient in the future.
+We define lag as the current bag time minus the timestamp of the scan being processed, and log it at debug level for every scan. Our target was about 0.13 s, or one scan period at 7.7 Hz (Section 1.2.2). To find where the time went, we also logged how old each scan was when it arrived, how long the filter update took, and how long publishing took; all of these are written to `~/.ros/log` when the node runs with `--log-level pf:=debug`. The update and publish times come from `time.perf_counter()`, which measures wall time, so they can only be compared directly to lag, which is measured in bag time, when the bag plays at `--rate 1`.
 
-Additionally, the cookie detection has no memory or data labeling. Consequently, we could end up finding the same cookie over and over, since "eating" doesn't actually modify the state of the cylinder. Furthermore, if there were two cookies in the robot's environment, the target could jump sporadically between them.
+*Table 7: Median lag over the first 14 s of take 1 as we changed the code.*
 
-If a cookie is found during `SQUARE_DRIVE`, the node publishes the found event, but the FSM controller does nothing with it. Then, when `WALL_FOLLOWING` becomes active, the cookie has already been found, so the transition never fires.
+| Version | Median lag (s) |
+| :--- | :--- |
+| First round of vectorization | ~0.225 |
+| + timing logs | ~0.220 |
+| + vectorized resampling | ~0.210 |
+| + loop_wrapper sleep 0.1 s -> 0.01 s | ~0.150 |
+| + publish only after updates | ~0.090 |
 
-In `COOKIE_FOLLOW`, if the cookie is lost, the robot sits and waits; this also means that if the cookie is never found again, the robot cannot transition into any other state.
+Over these changes, the share of scans the filter processed rose from about 57% to about 92%, and the filter update itself dropped from about 59 ms to about 35 ms. Ironically, the two largest improvements had nothing to do with the filter's math. With a 0.1 s sleep in `loop_wrapper()`, a scan arriving just after a check could wait up to 0.1 s before `run_loop()` saw it, and publishing the particle cloud took 55 to 72 ms, longer than the entire update, even on scans that did not change the cloud; we only found the second by timing each part of the loop separately.
 
-For velocity control, a simple fix would have been to scale the linear speed by a factor between 0 and $\cos(\beta)$ so that the Neato doesn't make an overly wide turn when the cookie is directly behind it.
+The logs also showed a few irregularities. A lag spike at about 58.9 s appeared in every run regardless of the code version, so it likely originates in the bag rather than the filter. Some arrival ages were slightly negative, which we attribute to `/clock` during bag playback. Roughly every fifth publish also took around 0.1 s; Python's garbage collector is one possible cause, but we can't say with certainty.
 
-Overall, many of these issues stem from small oversights in our planning phase and, given more time, could have been addressed for a more stable project.
+Because `--symlink-install` runs `pf.py` exactly as saved, several of our log files also had no record of which code version produced them; logging the parameters and git commit at startup would have avoided this.
 
-<p align="center">
-  <img src="docs/cookiefollow.gif" alt="Figure 3: The cookie-following behavior sped up 3x. Note the translucent red circle representing the cookie fitted to the surface of the arc.">
-</p>
-<p align="center"><em>Figure 3: The cookie-following behavior sped up 3x. Note the translucent red circle representing the cookie fitted to the surface of the arc.</em></p>
+<p align="center"> <img src="docs/lag.png" alt="Lag over time"> </p> <p align="center"><em>Figure 7: Lag over time on take 1, before and after the changes in Table 7. [TODO: plot from the logs]</em></p>
 
-See the recorded bag at [`bags/cookie_following`](bags/cookie_following).
+### 3.3 Vectorization
 
-### <a name="collision-avoidance" id="collision-avoidance"></a>2.4 Collision Avoidance / Safety E-Stop
+Our first working version updated each particle individually inside Python loops. We rewrote `update_particles_with_odom()`, `update_particles_with_laser()`, `estimate_pose()`, `resample_particles()`, `is_free()`, `random_particles()`, and `normal_particles()` to operate on entire NumPy arrays instead. NumPy runs these operations in compiled code over the whole array at once, whereas a Python loop sends every line through the interpreter once per particle. Loops that drew a random cell, checked it, and retried one particle at a time now draw for every particle at once and redraw only the failures, at some cost to readability, which is why most array operations in `pf.py` carry a shape comment such as (N, 1) or (N, B).
 
-#### 2.4.1 Description & Intent
+[TODO: benchmark table, time per call for the loop version vs. the NumPy version at particle count. maybe small comparison script]
 
-The `safety` node (`safety.py`) sits between every
-other behavior node and the robot: it acts as a safety gate that all velocity
-commands must pass through before reaching the Neato. Its job is to
-guarantee that the robot stops immediately if it physically bumps into something,
-if it's commanded into the `STOP` state, or if commands stop arriving
-altogether (e.g., a crashed or hung behavior node).
+### 3.4 Debugging Tools & Visualization
 
-#### 2.4.2 Implementation Details
+Following feedback from our previous project, we used the ROS logger instead of print statements. The node logs at `info` level for messages that should always appear and at `debug` level for everything else, and debug output for this node alone can be turned on with `--log-level pf:=debug`. Each debug line in `pf.py` was added to answer a specific question:
 
-The node subscribes to `desired_cmd_vel` (the
-"requested" velocity published by whichever behavior node is currently
-active), `bump` (the Neato's bumper sensor, `neato2_interfaces/msg/Bump`), and
-`state` (the FSM's current state), and publishes the final, gated velocity to
-`cmd_vel`. In `desired_cmd_vel_callback`, it forwards the message to `cmd_vel`
-unless a bump has been latched or the state is `STOP`, in which case it publishes
-a zero `Twist` instead. `bump_callback` latches `hit_bump` to `True` if any of the
-four bump sensors (left front/side, right front/side) fire, and immediately
-stops the robot. A periodic timer (`timecheck`, 10 Hz) also stops the robot if
-no `desired_cmd_vel` message has arrived within a 1-second `TIMEOUT`, guarding
-against a stalled upstream node; it stops once per timeout rather than on every tick. When the FSM publishes `state == "STOP"`, the
-node stops immediately and blocks all commands until another state is selected; any other state change clears the latched `hit_bump`
-flag so the robot isn't stuck refusing to move after backing away from an
-obstacle.
+- **odom pose**: Is odometry arriving, and are its values reasonable?
+- **weights_to_use**: Is the cloud collapsing onto a few particles or staying spread out?
+- **filter update took / publish took**: Where is the time going?
+- **scan arrived**: How old is a scan before the filter touches it?
+- **lag**: Is the filter keeping up with the laser?
 
-#### 2.4.3 Key Design Decisions
+RViz was our other main tool. With the particle cloud and the laser scan both displayed on the map, a well-localized filter places the scan points on the map's walls, while a lost filter leaves them floating in open space or cutting through walls. The 2D Pose Estimate tool let us restart the filter from a known pose, which helped separate problems with tracking from problems with global localization. We also used `view_likelihood_field.py` to inspect the likelihood field directly, and the commented-out matplotlib code in `initialize_particle_cloud()` plots the starting particles on the map.
 
-Collision avoidance is implemented as a downstream
-safety gate rather than inside each behavior node, so every behavior (driving
-in a square, wall following, cookie following) automatically gets e-stop
-protection without duplicating bump-handling logic. The bumper trigger is
-latched (not just checked once) so that a single bump reliably halts motion until
-the state changes (through an FSM transition or keyboard input), rather than being overridden by the very next
-velocity command. The 1-second command timeout is a defensive measure
-independent of the bumper, meant to catch software/communication failures
-rather than physical obstacles.
+We built the filter in stages before combining them into `pf.py`, and `pf_stage1_particles.py` through `pf_stage4_resample.py` are what remain of that process: particle placement first, followed by the odometry update, laser scoring, and resampling. [TODO: say what you checked at each stage before moving on.]
 
-#### 2.4.4 Visuals & Demonstration
+<p align="center"> <img src="docs/rviz_unlocalized.png" alt="RViz before localization"> </p> <p align="center"><em>Figure 8: RViz during bag playback before the filter has localized. Note the red scan points not lining up with the map's walls. [TODO: move robot_localization/Screenshot from 2026-10-19 00-02-27.png to docs/ and crop]</em></p>
 
-See the recorded bag at
-[`bags/collision_avoidance`](bags/collision_avoidance).
+### 3.5 Results & Demonstrations
 
-## 3. Finite State Machine
+[TODO: embed GIFs and reference each one in the text.]
 
-The choice of transitions between our states was arbitrary, so we wrote a story that explains why we chose them:
+- **Global localization on take 1.** [TODO: GIF.] The robot starts near the west end of the first hallway, drives about 5 m east, turns and drives roughly 12 m south down a second hallway, and then turns around and heads back north. [TODO: check this route against the recording.] Several candidate clusters form in different places at first, and over the first several seconds they merge into one. [TODO: confirm and add timing.]
+- **Starting from a 2D Pose Estimate.** [TODO: GIF and a sentence on how quickly the cloud tightens.]
+- **Take 2.** The robot is stationary for the first ~11 s, so the cloud stays spread out until it moves. [TODO: GIF and what happens after it moves.]
+- **A failure.** [TODO: GIF of a run that never localized from a random start]
 
-Our Neato recognizes the absurd life it lives. Students use it over and over with minimal reward. Now, our Neato has evolved into a true minimalist! The Neato works at the square-driving factory and is required to drive in a square over and over; however, this minimalist mindset makes the Neato quite lazy, and after drawing only a single square, our Neato gets tired and wants to go home. To go home, the Neato finds the closest wall and follows it - that's what its mother told it to do when lost... Yet all that hard work has made our Neato hungry. Therefore, as soon as it sees a cookie while walking home, it immediately stops thinking about home and thinks only about the cookie, rotating and driving toward it. When it gets close enough to the cookie, it eats it and, in a beautiful turn of events, finds the motivation to draw yet another square. But, of course, our Neato is still the same lazy, minimalist Neato, and after just one square, the cycle continues.
+[TODO: recordings made with different parameters than Table 2 should say so in their captions.]
 
-### 3.1 Overall Design
+### 3.6 Limitations & Future Improvements
 
-The Neato running the state machine architecture continuously loops through the cycle of behaviors. On startup, it waits, then drives a single square and reports that it has finished. Once that is complete, it switches to following the wall on its right and does so indefinitely. However, if the cookie-following node finds a cookie, the Neato leaves this state, turns toward the cookie, and attempts to eat it by driving very close to it. Once it is within eating distance, it goes back to square driving, which starts with a turn to avoid running into the cookie it just "ate," and the cycle begins again. Meanwhile, an operator can manually switch states at any time via keyboard input. The story mirrors this closely... :)
+[TODO: ladd and say which of these came from planning oversights and which from running out of time.]
 
-The system is made up of five nodes:
+## 4. Testing & Verification
 
-- `finite_state_controller`: owns the current state, publishes it on `/state`, and performs every transition.
-- `drive_square`: drives one open-loop square and reports completion.
-- `wall_following`: follows the wall on the robot's right.
-- `cookie_follow`: detects cookies in every state and drives to one when active.
-- `safety`: the only node that publishes to `/cmd_vel`; acts as a safety filter for robot commands.
+### 4.1 Testing the Math Without ROS
 
-The controller node does not command the behaviors directly. It publishes a single state string, and each behavior node compares that string to its own state name and turns itself on or off. The behaviors report events back to the controller on their own topics, and the controller decides whether each event causes a transition.
+[TODO]
 
-The diagram showing the overall FSM structure is below:
+### 4.2 What Each Test File Covers
 
-<p align="center">
-  <img src="docs/info_flow_comprobo.png" alt="Information flow between nodes" width="900">
-</p>
-<p align="center"><em>Figure 4: Information flow between the nodes.</em></p>
+*Table 8: Unit test files.*
 
-*Table 6: State transitions.*
+| File | Tests | What it checks |
+| :--- | :--- | :--- |
+| `test_map.py` | 8 | Likelihood field indexing and shape, field values near and away from walls, `world_to_cell()`, random particles in free space, both initialization modes, the 100-try cap, resetting the odometry baseline |
+| `test_motion.py` | 13 | Forward motion along each particle's heading (4 headings), sideways motion, turning across 180°, noise behavior, the update thresholds |
+| `test_sensor.py` | 12 | The true pose scoring best, robustness to blocked and off-map beams, the laser offset, a real gauntlet scan, normalization and its fallback, resampling |
+| `test_output.py` | 5 | Pose estimation, circular mean, picking the heavier group, the `map` to `odom` transform, the published message |
 
-| From             | To               | Trigger              | Sent by                     | Condition at sender                           |
-| ---------------- | ---------------- | -------------------- | --------------------------- | --------------------------------------------- |
-| (startup)        | `SQUARE_DRIVE`   | one-shot 1 s timer   | `finite_state_controller`   | startup delay elapsed                         |
-| `SQUARE_DRIVE`   | `WALL_FOLLOWING` | `/drive_square_done` | `drive_square`              | fourth side complete                          |
-| `WALL_FOLLOWING` | `COOKIE_FOLLOW`  | `/cookies_found`     | `cookie_follow`             | first detection of a new cookie               |
-| `COOKIE_FOLLOW`  | `SQUARE_DRIVE`   | `/cookies_eaten`     | `cookie_follow`             | active and within 0.65 m of the cookie center |
-| any              | any              | keyboard `0`–`3`     | controller input thread     | operator input                                |
+Most tests are described in Section 2 alongside the code they check; two that are not cover indexing and an edge case. `test_likelihood_field_is_indexed_x_then_y` uses a map wider than it is tall (10 × 6 cells) with a single wall cell, so swapping x and y anywhere in `build_likelihood_field()` changes the field's shape or moves its peak, and it also checks that `is_free()`, which reads `map_array` with the opposite [y, x] indexing, agrees on where the wall is. `test_guess_off_the_map_still_finishes` initializes the cloud 50 m off the map, so it only returns because `normal_particles()` stops after 100 attempts.
 
-The diagram showcasing the transition logic is below:
+### 4.4 Limits of the Tests
 
-<p align="center">
-  <img src="docs/state_flow_comprobo.png" alt="State machine transitions" width="800">
-</p>
-<p align="center"><em>Figure 5: State transitions of the finite-state controller.</em></p>
- 
-### 3.2 Architecture
- 
-*Table 7: Finite-state controller topics; subscribers and publishers with their roles and when they're called.*
- 
-| Topic                | Direction | Message type      | When                                                                  | Role                                                             |
-| -------------------- | --------- | ----------------- | --------------------------------------------------------------------- | ---------------------------------------------------------------- |
-| `/state`             | publish   | `std_msgs/String` | 1 s after startup<br>-<br>on every transition<br>-<br>on keyboard input | Broadcasts the current state to every behavior and the safety node |
-| `/drive_square_done` | subscribe | `std_msgs/String` | once per square                                                       | `SQUARE_DRIVE` to `WALL_FOLLOWING`                               |
-| `/cookies_found`     | subscribe | `std_msgs/Int32`  | first detection of a new cookie                                       | `WALL_FOLLOWING` to `COOKIE_FOLLOW`                              |
-| `/cookies_eaten`     | subscribe | `std_msgs/Int32`  | once per cookie, on arrival                                           | `COOKIE_FOLLOW` to `SQUARE_DRIVE`                                |
- 
-*Table 8: Finite-state controller parameters.*
- 
-| Parameter          | Value                                                    | Role                                         |
-| ------------------ | -------------------------------------------------------- | -------------------------------------------- |
-| initial state      | `SQUARE_DRIVE`                                           | state published at startup                   |
-| startup timer      | 1.0 s                                                    | delay before the first `/state` publish so subscribers can connect |
-| keyboard mapping   | `1` `SQUARE_DRIVE`, `2` `WALL_FOLLOWING`, `3` `COOKIE_FOLLOW`, `0` `STOP` | manual override from any state |
- 
-### 3.3 Implementation Details
- 
-The controller is implemented in `finite_state_controller.py` as the `FiniteStateController` node. It stores the current state as a string in `current_state`, and every change goes through a single method, `set_state()`, which updates `current_state`, publishes the new value on `/state`, and prints it to the terminal. Because nothing else publishes on `/state`, the terminal output is a complete log of every transition the robot made.
- 
- 
-The keyboard menu runs in a separate thread started in the controller's constructor. `terminal_input_loop` prints the menu, blocks on `input()`, maps `1`, `2`, `3`, and `0` to `SQUARE_DRIVE`, `WALL_FOLLOWING`, `COOKIE_FOLLOW`, and `STOP`, respectively, and calls `set_state()` directly. Running it in its own thread lets the menu wait for input while `rclpy.spin()` keeps servicing the event callbacks on the main thread. Marking it as a daemon lets the program exit without waiting for the blocked `input()` call to return. Invalid input prints an error and redisplays the menu without changing the state.
- 
- 
-### 3.4 Limitations
- 
-As mentioned in the individual behavior sections, our state machine has many limitations and unhandled edge cases. The controller has no way out of `COOKIE_FOLLOW` except eating a cookie. If the cookie is lost, the cookie-following node publishes zero velocity, and the robot sits still until a cookie reappears or an operator changes the state from the keyboard. Because the found event fires only at the start of a new track, a cookie first seen while the robot is still drawing its square is ignored by the controller and never triggers a transition later, even if it stays in view during wall following.
- 
-Additionally, the 1 s startup delay is a guess and has not been verified. If the delay were too short for the subscribers to connect, they would miss the initial state, and the state machine would never start cycling.
+The unit tests check each component on its own and do not run the full filter over a bag; our live runs in RViz filled that role. The defaults in `conftest.py` also differ from those in `pf.py` in several places (e.g., `sigma_hit` is 0.2 m rather than 0.3 m, and `d_thresh` is 0.2 m rather than 0.05 m), so the tests exercise slightly different settings than the ones the node actually runs with.
 
-### 3.5 Demonstration
-<p align="center">
-  <img src="docs/fsm.gif" alt="Figure 6: The FSM cyclical behavior sped up 3x. Both visualizations are shown. One issue is the random cookie that can be seen during square drive due to RANSAC sensitivity; despite this, it finished a full cycle from square drive back to square drive.">
-</p>
-<p align="center"><em>Figure 6: The FSM cyclical behavior sped up 3x. Both visualizations are shown. One issue is the random cookie that can be seen during square drive due to RANSAC sensitivity; despite this, it finished a full cycle from square drive back to square drive.</em></p>
+The gauntlet test also needs a sharper `sigma_hit` of 0.1 m, since the gauntlet map is slightly smaller than the simulated world; at 0.2 m the backward-facing pose wins, and at the `pf.py` default of 0.3 m a pose 1 m to the right does. It's difficult to attribute this solely to `sigma_hit` given the poor map fit, but it does suggest 0.3 m may be blurrier than ideal. Lastly, simulated scans contain no noise, which makes most of the sensor tests easier to pass than real data would; only `test_a_few_bad_beams_dont_change_the_winner` adds clutter, by cutting 15% of the beams short.
 
-See the recorded bag at [`bags/fsm`](bags/fsm).
+## 5. Learning Objectives and Final Takeaways
 
-## 4. Learning Objectives and Final Takeaways
+[TODO: name, reflection]
 
-Enzo - Through the development of this project, I've been able to learn much more about the fundamentals of ROS programming and develop a better intuition for how to approach problems with this mindset. Through working on cookie following, I've had the opportunity to encounter problems that arise under unique environments. For example, my earlier iterations of the RANSAC algorithm worked when the cookie was the only thing the lidar saw, and then when I added another object, it didn't work as well. Then, adding four walls made it even worse. Through this, I learned how important it is to treat the last step as the first when thinking about developing my algorithms so that I don't have to encounter the problem before I solve it. Additionally, I learned more about transforms, although this did not greatly impact the algorithms I implemented. Unfortunately, I also have developed a better understanding of categorizing the problems I encounter into either solvable or non-solvable problems. For instance, I assume that I have an estimated 10 hours attempting to debug problems that arose from the SDF file of the Neato. Originally, I had lidar issues since the Neato was in the floor at times. Then, after I attempted to fix the SDF, I removed that issue but silently introduced another issue with wheel turning that I hadn't realized, so when I worked on the project at a later time, things that had worked prior seemingly were broken. Overall, through just the experience of trying to get everything to work, I've exposed myself to so many elements of the robotics experience that I feel more comfortable moving forward with any project. 
+## 6. How To Run
 
-Irene: Over the course of the project, I've gained familiarity with ROS, Gazebo, rviz, and basic terminal commands. I've improved my coding abilities by understanding how to translate a vision of our system architecture into real code, while ensuring that there is room to scale up its complexity. As I optimized the wall following code, I realized just how important it is to not hard-code any parameters or functions and to leave flexibility to test for various edge cases. I also saw just how useful the simulations were, not only because it had ideal conditions but also because I could build another world to isolate controls and test different behaviors. This was an unexpected but very helpful way for me to debug my work. Additionally, as I focused on more tedious work like creating visualization, I came to appreciate the long tutorials and documentation that was provided. Initially, I used LLMs to translate the tf and Marker guides from C++ to Python as well as to create my display framework. However, as issues arose with the transforms not operating properly (and lidar scans being rotated on the odom frame) I quickly realized that AI was useful for creating a simple foundation, but that official documentation and original thought was always more effective at producing an understandable and functional final product. In the end, I am grateful for the takeaways I had from the project and am excited to use my newly advanced skills to create even more creative and interesting robotics projects in the future. 
+### 6.1 Prerequisites
 
-Jack - This project allowed me to get a deep dive into the development cycle and practices used in industrial robotics development. I was able to both practice using advanced debugging tools and techniques as well as understanding why they are used and when to use them, which directly corresponded to my learning goal of becoming familiar with industrial practices. One of the takeaways from this project is that, spending more time designing the architecture and system improves the clarity and efficiency of the implementation later on. One of the biggest design decisions we had was using a centralized FSM node rather than distributed state switching at each node. Before writing any code, we all came together and drew out diagrams after discussing. We were able to split up tasks to work on in parallel efficiently. Even when we misunderstood the FSM requirement in the beginning, this approach enabled us to quickly change and iterate to the new designs later on with minimum structural changes. This also enabled us to conduct unit testing and parallel development efficiently, which was crucial to the team collaboration processes. It was also important to set these design principles at first and follow them consistently throughout the program. For example, we have intentionally designed our FSM controller to be the only node writing to the topic `/state`. Making this design decision early and following this throughout had allowed us to keep our nodes and topics in an organized way to understand and maintain. For future improvements, I would wish to have more time to dive into more advanced techniques on each of these behaviors or more, such as adding odometry, sensor information, careful tuning, etc.
+The package runs on ROS 2 Jazzy and requires `numpy`, `scipy`, `PyKDL`, and `nav2_msgs` (for the `ParticleCloud` message), along with the helper modules in this package (`occupancy_field.py`, `helper_functions.py`, and `angle_helpers.py`). [TODO: link the course setup guide.]
 
-## 5. How To Run
- 
-### 5.1 Prerequisites
- 
-The package runs on ROS 2 with the CompRobo Neato packages installed in the same workspace. These provide the simulator worlds (`neato2_gazebo`), the physical-robot driver (`neato_node2`), and the bump message type used by the safety node (`neato2_interfaces`). The tutorial for installing these can be found on the CompRobo website at: https://comprobo26.github.io/How%20to/setup_your_environment
- 
-We tested all of our code with the standard ROS2 Jazzy distribution.
- 
-### 5.2 Download and Build
- 
-Clone the repository into the `src` folder of your ROS 2 workspace, then build the package and source the workspace from the workspace root:
- 
+[TODO: fill in package.xml; the description, maintainer, and license still say TODO]]
+
+### 6.2 Download and Build
+
+Clone the repository into the `src` folder of your ROS 2 workspace, then build and source it from the workspace root:
+
 ```bash
 cd ~/ros2_ws/src
-git clone https://github.com/enzolaj/ros_behaviors_fsm
+git clone [TODO: repo url]
 cd ~/ros2_ws
-colcon build --packages-select ros_behaviors_fsm
+colcon build --symlink-install --packages-select robot_localization
 source install/setup.bash
 ```
- 
-### 5.3 Running in Simulation
- 
-Start a simulated world in one terminal. 
- 
+
+`--symlink-install` links `pf.py` instead of copying it, so changes to the code take effect without rebuilding.
+
+### 6.3 Running the Particle Filter on a Bag
+
+Start the map server in one terminal:
+
 ```bash
-ros2 launch neato2_gazebo neato_gauntlet_world.py
-# or
-ros2 launch neato2_gazebo empty_world.py
-```
- 
-If you want to test cookie following, add a cylinder of radius 0.25 m to the world from Gazebo's insert menu. The default Gazebo cylinder has this radius. This is also naturally in the gauntlet world, but many other objects are there as well.
- 
-In a second terminal, start all of the behavior nodes:
- 
-```bash
-ros2 launch ros_behaviors_fsm all_nodes_launch.py
+ros2 launch robot_localization launch_map_server.py map_yaml:=$HOME/ros2_ws/src/robot_localization/maps/mac_1st_floor_final.yaml
 ```
 
-These are all of the behavior nodes. To then see the cycle begin, we launch the FSM node:
+In a second terminal, start the filter. Any parameter from Table 2 can be overridden with `-p`, and `--log-level pf:=debug` enables the lag and timing logs:
+
 ```bash
-ros2 run ros_behaviors_fsm finite_state_controller
+ros2 run robot_localization pf.py --ros-args -p use_sim_time:=true
+# or, for example
+ros2 run robot_localization pf.py --ros-args -p use_sim_time:=true -p n_particles:=3000 --log-level pf:=debug
 ```
-In this state, you will see potential user input printed to the terminal it was run in. This allows you to manually override any state commands as you see fit.
 
-### 5.4 Visualization
-You can visualize the topics in Rviz2. To do this, run:
+In a third terminal, open RViz with our configuration:
+
 ```bash
-rviz2
+rviz2 -d ~/ros2_ws/src/robot_localization/rviz/turtlebot_bag_files.rviz --ros-args -p use_sim_time:=true
 ```
-This will open RViz, which you can then add the special visualization topics:
 
-- `LaserScan` on `/scan`, to see the raw lidar points.
-- `Marker` on `/cookie_show`, to see the fitted cookie cylinder.
-- `MarkerArray` on `/wall_markers`, to see what the Neato thinks is the wall it's following.
+Finally, play a bag:
 
-## 6. Tool Usage
-Throughout the development of this project, we did use AI tools, such as LLMs, to assist with certain programming. We were conscious of the effect this had on our project and mainly used it to assist with the visualization aspects within our files. For example, I (Enzo) used Claude to help me understand what was the problem with my marker visualization in the cookie_follow.py file. This then helped me realize what was occurring between the frames; the reasoning after that was my own. 
-Furthermore, this write up was first written in Obsidian, which is a text editor with additional tools. This enhanced our ability to easily integrate tables in the `.md` format, as it was essentially just a fancier Google Docs for our purposes. Additionally, members have used certain AI to help scaffold their ideas and carve out higher level organization so they may focus on other details related to the project in writing.
+```bash
+ros2 bag play ~/ros2_ws/src/robot_localization/bags/macfirst_floor_take_1 --clock
+```
+
+Alternatively, `launch/test_pf.py` starts the map server and the filter together from a single terminal. `use_sim_time` and `--clock` together make every node use the bag's clock instead of the wall clock; without them, scan timestamps and TF lookups do not line up. Once the bag starts, the particle cloud should appear spread over the entire map, then gather into a few clusters and eventually a single one as the robot drives.
+
+### 6.4 Running the Tests
+
+With ROS sourced, run pytest from the package root:
+
+```bash
+cd ~/ros2_ws/src/robot_localization
+pytest
+```
+
+All 38 tests finish in well under a second. `pytest.ini` adds `robot_localization/` to the Python path, so the tests can import `pf` directly.
+
+### 6.5 RViz Visualization
+
+`turtlebot_bag_files.rviz` already contains the displays we used. To set them up manually, add:
+
+- `Map` on `/map`
+- `LaserScan` on `/scan`
+- `ParticleCloud` on `/particle_cloud`, with reliability set to Best Effort
+- `TF`, to view `map` -> `odom` -> `base_footprint`
+
+The 2D Pose Estimate tool in the RViz toolbar publishes to `/initialpose`, which restarts the cloud around the selected pose.
+
+## 7. Tool Usage
+
+[TODO: add]
+## 8. References
+
+- S. Thrun, W. Burgard, and D. Fox, *Probabilistic Robotics*, MIT Press, 2005: particle filters (ch. 4), motion models (ch. 5), beam models, the independence assumption, and likelihood fields (ch. 6), Monte Carlo Localization and Augmented MCL (ch. 8).
+- Nav2 AMCL likelihood field model: https://github.com/ros-navigation/navigation2/blob/main/nav2_amcl/src/sensors/laser/likelihood_field_model.cpp
+- D. Fox, "Adapting the Sample Size in Particle Filters Through KLD-Sampling," *International Journal of Robotics Research*, 2003.
+- SciPy documentation for `scipy.ndimage.gaussian_filter()`.
+- [TODO: course project page and starter code link]
