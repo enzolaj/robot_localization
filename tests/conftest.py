@@ -1,8 +1,10 @@
-""" setup shared by all the test files. pytest loads this file automatically, and anything marked
-    @pytest.fixture in here can be used by any test just by putting its name in the test's arguments.
-    The reason for this architecture is that we cannot make a ParticleFilter instance, as it hangs
-    on a map_server call which never happens in our testing design. Thus, we are creating an object
-    and bypassing the __init__ portion via __new__. This architecture was influenced by an LLM.
+"""Shared pytest fixtures for the other particle filter unit tests.
+
+ParticleFilter.__init__ waits on the ROS map_server service and initializes TF
+listeners which stalls pytest. These fixtures are pseudo-classes and instantiate
+the filter via __new__ (to bypass __init__) and populate only the attributes required
+by the math and update methods. Using the __new__ method and certain ROS objects
+were ideas from an LLM.
 """
 
 import math
@@ -15,13 +17,13 @@ import pytest
 import yaml
 from PIL import Image
 
-import pf as particle_filter     # 'pf' on its own is already the name of our test filter
+import pf as particle_filter		# cant use pf since it is name of variable in pytest
 from helper_functions import TFHelper
+from rclpy.logging import get_logger
 
-package_dir = Path(__file__).parent.parent
+package_dir = Path(__file__).parent.parent		# package root for loading map files
 
-# the default settings from the declare_parameter calls in pf.py. __init__ never runs in the tests,
-# so the test filters get their settings from here, which is just a mirror (dont forget to update!!!)
+# manually copied from declare_parameter() in pf.py, so ensure they match
 DEFAULTS = {
     "n_particles": 1200,
     "d_thresh": 0.2,
@@ -37,107 +39,134 @@ DEFAULTS = {
     "odom_trans_noise": 0.1,
     "odom_rot_noise": 0.1,
     "cluster_radius": 0.5,
+    "log_scale": 10.0,
 }
 
 
 def room_grid():
-    """ our main test map: a 3 m by 2 m room, 60 by 40 cells at 5 cm each, with walls all the way
-        around and a box near one corner. the grid is indexed grid[x cell, y cell], with 100 for a wall
-        and 0 for open floor.
+    """Creates a 3 m x 2 m occupancy grid with an asymmetric obstacle.
 
-        we added the box because an empty rectangle looks exactly the same after turning it 180
-        degrees. the laser would have no way to tell those two poses apart, and the laser tests could
-        end up passing or failing because of that instead of because of our code. """
-    grid = np.zeros((60, 40), dtype=int)
-    grid[0, :] = grid[-1, :] = 100     # left and right walls
-    grid[:, 0] = grid[:, -1] = 100     # bottom and top walls
-    grid[44:51, 8:15] = 100            # the box, covering about x = 0.7 to 1.05 m and y = -0.6 to -0.25 m
+    Returns:
+        np.ndarray: A 60 x 40 integer array indexed as [x, y] at 0.05 m/cell,
+            where 100 = occupied wall cell and 0 = free space.
+    """
+    grid = np.zeros((60, 40), dtype=int)		# 3.0 m x 2.0 m at 0.05 m resolution (from yaml)
+    grid[0, :] = grid[-1, :] = 100		# left and right boundary walls
+    grid[:, 0] = grid[:, -1] = 100		# bottom and top boundary walls
+
+    # add off-center box so the room is not symmetric under 180 deg turns
+    grid[44:51, 8:15] = 100		# x from [0.70, 1.05] m, y from [-0.60, -0.25] m
     return grid
 
 
 def fake_occupancy_field(grid, resolution=0.05, origin=(-1.5, -1.0)):
-    """ dresses up a grid so the filter can use it in place of the real OccupancyField. the filter only
-        ever reads two things from it: .map, which looks like the OccupancyGrid message map_server
-        sends, and .map_array, the 2d copy my partner added.
+    """Wraps a 2D grid array into a mock OccupancyField object.
 
-        SimpleNamespace is an empty object that we can stick attributes on, which is enough to fake a
-        message as long as the filter only reads from it. """
+    Uses SimpleNamespace ("dummy" object supporting dot-access like
+    obj.attr) so pf.py can access .map.info just like the real
+    ROS message without actually running ROS.
+
+    Args:
+        grid (np.ndarray): Occupancy values indexed as [x, y].
+        resolution (float): Grid cell size in m (default = 0.05).
+        origin (tuple[float, float]): World (x, y) coords of the bottom-left
+            grid cell. Default = (-1.5, -1.0) to center the room map on (0, 0).
+
+    Returns:
+        SimpleNamespace: A mock OccupancyField containing `map` (mimicking a
+            nav_msgs/OccupancyGrid message) and `map_array` indexed by [y, x].
+    """
     width, height = grid.shape
-    # the real message stores the map as one long list. it starts at the bottom left corner and goes
-    # along x first, finishing one row of y before starting the next. flipping our grid to [y, x] and
-    # flattening it gives that same order.
+
+    # transpose from [x, y] to [y, x] and flatten to 1D list to match OccupancyGrid.data
     data = grid.T.flatten().tolist()
+
+    # This formatting was LLM assisted.
+    # nest SimpleNamespaces to fake the ROS nav_msgs/MapMetaData dot-attribute hierarchy
     info = SimpleNamespace(resolution=resolution, width=width, height=height,
                            origin=SimpleNamespace(position=SimpleNamespace(x=origin[0], y=origin[1])))
-    # occupancy_field.py fills map_array as [y, x], so it gets the flipped grid too
+
+    # occupancy_field.py stores map_array as [y, x] floats, whereas input grid is [x, y]
     return SimpleNamespace(map=SimpleNamespace(data=data, info=info),
                            map_array=grid.T.astype(float))
 
 
 def load_map_file(yaml_name):
-    """ loads one of the real maps from the maps folder, using the same rules map_server uses to turn
-        the image into walls and open space """
+    """Loads a ROS map YAML and image file into a mock OccupancyField.
+
+    Args:
+        yaml_name (str): Filename of the map config inside `maps/` (e.g., "gauntlet.yaml").
+
+    Returns:
+        SimpleNamespace: A mock OccupancyField populated with the map data.
+    """
     yaml_file = package_dir / "maps" / yaml_name
     cfg = yaml.safe_load(open(yaml_file))
     img = np.array(Image.open(yaml_file.parent / cfg["image"]))
 
-    # black pixels are walls and white pixels are open floor. map_server turns each pixel into a chance
-    # of being a wall (0 for white, 1 for black), then uses the two thresholds from the yaml to decide.
-    # anything in between the thresholds is marked unknown (-1).
+    # convert pixel brightness (0 = black/wall, 255 = white/free) to occupancy prob [0, 1]
     p_occupied = (255 - img) / 255.0
+
+    # threshold probabilities into ROS occupancy values: 100 = wall, 0 = free, -1 = unknown
     grid = np.where(p_occupied > cfg["occupied_thresh"], 100,
                     np.where(p_occupied < cfg["free_thresh"], 0, -1))
 
-    # the first row of an image is its top edge, but the map starts from the bottom left corner, so we
-    # flip the image upside down. then .T swaps it from [row, column] to [x, y].
+    # image row 0 is top-left, but map y=0 is bottom-left: flip vertically, then transpose [y, x] to [x, y]
     grid = np.flipud(grid).T
     return fake_occupancy_field(grid, cfg["resolution"], cfg["origin"][:2])
 
 
 @pytest.fixture(autouse=True)
 def seed():
-    # autouse means this runs before every test without being asked for. the filter uses random numbers
-    # everywhere: np.random for noise and python's random module for picking map cells. seeding both
-    # means a test gets the same random numbers every run, so it can't pass one time and fail the next.
-    np.random.seed(0)
-    random.seed(0)
+    """Seeds random number generators before each test for deterministic execution.
+
+    `autouse=True` tells pytest to run this automatically before every test
+    without needing to pass `seed` as a test function argument.
+    """
+    np.random.seed(0)		# seed numpy rng used for gaussian noise in pf.py
+    random.seed(0)		# seed python rng used for random cell picks in random_particle
 
 
 @pytest.fixture
 def make_pf():
-    """ gives tests a function for building a filter. make_pf() makes one on the room map with the default
-        settings. make_pf(n_particles=5) changes a setting, and make_pf(occupancy_field=...) uses a
-        different map. """
+    """Provides a factory function to instantiate ParticleFilter without ROS nodes.
+
+    Because pytest fixtures cannot take custom arguments directly from a test,
+    this fixture returns an inner `make()` builder function that tests can call
+    with custom settings (e.g., `pf = make_pf(n_particles=5)`).
+
+    Returns:
+        Callable: A builder function accepting an optional `occupancy_field` and
+            keyword overrides for any parameter in `DEFAULTS`.
+    """
     def make(occupancy_field=None, **settings):
-        # make the object without running __init__ (see the top of this file for why)
+        # __new__ allocates the ParticleFilter instance in memory without calling __init__
         pf = particle_filter.ParticleFilter.__new__(particle_filter.ParticleFilter)
 
-        # start from the defaults, then apply whatever the test asked to change
+        # merge DEFAULTS dict with any **settings overrides and attach each as an attribute on pf
         for name, value in {**DEFAULTS, **settings}.items():
             setattr(pf, name, value)
 
         pf.map_frame = "map"
+        pf.get_logger = lambda: get_logger("pf")		# no ROS node here, so give pf.py's debug logs a plain rclpy logger
         pf.occupancy_field = occupancy_field or fake_occupancy_field(room_grid())
 
-        # TFHelper has the same problem as the filter: its __init__ sets up tf. but the parts we use,
-        # like angle_diff and angle_normalize, are just math, so skipping __init__ is fine here too.
+        # allocate TFHelper via __new__ as well so we can call its angle/pose math methods without ROS tf
         pf.transform_helper = TFHelper.__new__(TFHelper)
 
-        # put the laser right at the center of the robot, which keeps most tests simple. the one test
-        # that checks the real 8.4 cm offset sets it itself.
-        pf.laser_offset = (0.0, 0.0)
-
+        pf.laser_offset = (0.0, 0.0)		# laser at robot center by default (overridden in offset test)
         pf.particle_cloud = []
         pf.particle_weights = []
+
+        # initialize odom tracking state at the origin (0, 0, 0)
         pf.current_odom_xy_theta = (0.0, 0.0, 0.0)
         pf.odom_pose = particle_filter.Particle(0.0, 0.0, 0.0).as_pose()
 
-        # instead of sending messages anywhere, the fake publisher adds them to a list so a test can
-        # look at what would have gone out
+        # fake ROS publisher: calling pf.particle_pub.publish(msg) appends msg to pf.published list
         pf.published = []
         pf.particle_pub = SimpleNamespace(publish=pf.published.append)
 
-        # __init__ normally does this step, so we do it here
+        # precompute likelihood distance field last since it reads pf.occupancy_field and pf.sigma_hit
         pf.build_likelihood_field()
         return pf
     return make
@@ -145,53 +174,81 @@ def make_pf():
 
 @pytest.fixture
 def pf(make_pf):
-    """ a filter on the room map with default settings, for tests that don't need anything special """
+    """Provides a default ParticleFilter instance configured with the room map.
+
+    Args:
+        make_pf (Callable): The particle filter factory fixture injected by pytest.
+
+    Returns:
+        particle_filter.ParticleFilter: A configured filter instance using `DEFAULTS`.
+    """
     return make_pf()
 
 
 @pytest.fixture
 def make_map():
-    """ for tests that want to build their own small map: make_map(grid, resolution, origin) """
+    """Exposes the `fake_occupancy_field` helper as a pytest fixture.
+
+    Returns:
+        Callable: The `fake_occupancy_field` function for building custom test maps.
+    """
     return fake_occupancy_field
 
 
 @pytest.fixture(scope="session")
 def gauntlet_map():
-    # the real gauntlet map. it's big, so scope="session" loads it once for the whole test run
-    # instead of once for every test that uses it.
+    """Loads the gauntlet map once per test session.
+
+    `scope="session"` caches the loaded map across all tests in the pytest run
+    so the PNG image only has to be parsed once.
+
+    Returns:
+        SimpleNamespace: The mock OccupancyField for `gauntlet.yaml`.
+    """
     return load_map_file("gauntlet.yaml")
 
 
 @pytest.fixture
 def simulate_scan():
-    """ gives tests a fake laser. simulate(pf, pose, theta) returns the ranges a perfect laser would
-        measure from that pose, one for each beam angle in theta. this lets us test the scoring with
-        scans where we know exactly where the robot was. """
-    def simulate(pf, pose, theta, max_range=5.0):
+    """Provides a raycasting function to simulate noise-free laser range scans.
+
+    Returns:
+        Callable: A `simulate(pf, pose, theta, max_range)` function that returns
+            an array of simulated beam distances in meters.
+    """
+    def simulate(pf, pose, theta, max_range=5.0):		# 5.0 m = approx physical neato lidar max range
+        """Casts rays from a robot pose to compute distances to the nearest walls.
+
+        Args:
+            pf (particle_filter.ParticleFilter): Filter instance containing the map.
+            pose (tuple[float, float, float]): Robot (x (m), y (m), heading (rad)) pose in map frame.
+            theta (Sequence[float]): Beam angles in rad relative to robot heading.
+            max_range (float): Max raycast distance in m (default = 5.0).
+
+        Returns:
+            np.ndarray: Array of distances to the first wall hit in m (`np.inf` = no hit).
+        """
         x, y, heading = pose
 
-        # the scan comes from the laser, which sits at laser_offset on the robot, so first work out
-        # where the laser is on the map. this is the same rotate-then-shift math the filter uses.
+        # 2D rotation matrix to transform laser_offset from robot base_link frame to global map frame
         laser_x = x + pf.laser_offset[0] * math.cos(heading) - pf.laser_offset[1] * math.sin(heading)
         laser_y = y + pf.laser_offset[0] * math.sin(heading) + pf.laser_offset[1] * math.cos(heading)
 
-        # walk outward along each beam in small steps (a quarter of a cell) until we land in a wall cell
+        # march along ray in 1/4 cell increments so diagonal rays cant skip diagonally across thin walls
         step = pf.map_resolution / 4
         distances = np.arange(step, max_range, step)
 
-        # a beam that never hits anything comes back as inf, like the real laser does
-        ranges = np.full(len(theta), np.inf)
+        ranges = np.full(len(theta), np.inf)		# default to inf (no hit) to match real lidar behavior
         for k in range(len(theta)):
+            # compute (x, y) coords for all sample steps along beam k at global angle (heading + theta[k])
             xs = laser_x + distances * math.cos(heading + theta[k])
             ys = laser_y + distances * math.sin(heading + theta[k])
             ix, iy, on_map = pf.world_to_cell(xs, ys)
 
-            # mark which steps landed on a wall. map_array is [y, x], and we only check steps that are
-            # on the map, since the ones off the edge don't have a cell to look up.
+            # only index map_array where on_map is True so negative out-of-bounds indices dont wrap around in numpy
             hit = on_map.copy()
-            hit[on_map] = pf.occupancy_field.map_array[iy[on_map], ix[on_map]] > 0
+            hit[on_map] = pf.occupancy_field.map_array[iy[on_map], ix[on_map]] > 0		# > 0 hits walls (100), ignores free (0) and unknown (-1)
             if hit.any():
-                # argmax on a list of True/False gives the index of the first True, the first wall we reach
-                ranges[k] = distances[np.argmax(hit)]
+                ranges[k] = distances[np.argmax(hit)]		# np.argmax on a boolean array returns the index of the first True
         return ranges
     return simulate

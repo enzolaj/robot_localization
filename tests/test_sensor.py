@@ -1,5 +1,8 @@
-""" tests for using the laser: scoring particles against a scan, normalizing the weights, and
-    resampling based on those weights """
+"""Unit tests for the laser sensor model and resampling.
+
+Covers scoring particles against simulated and real scans, normalizing the weights, and resampling
+the cloud based on those weights.
+"""
 
 import math
 from pathlib import Path
@@ -7,27 +10,37 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-# 180 beam angles spread evenly all the way around the robot. these are already measured from the
-# front of the robot, which is what update_particles_with_laser expects
+# 180 evenly spaced beam angles [rad] around the robot, measured from its front like
+# update_particles_with_laser expects
 theta = np.linspace(-math.pi, math.pi, 180, endpoint=False)
 
-# where the robot really is for most of these tests, picked to be somewhere in the open
+# where the robot really is for most of these tests [x (m), y (m), theta (rad)], somewhere in the open
 true_pose = np.array([-0.4, 0.2, 0.5])
 
-# the true pose plus some wrong guesses near it, added to true_pose below. the first row is zero, so
-# the first particle is always the right answer.
+# wrong guesses near true_pose, added to it below. the first row is zero so particle 0 is always right
 offsets = np.array([
-    [0.0, 0.0, 0.0],      # the true pose
-    [0.2, 0.0, 0.0],      # 20 cm off in x
-    [0.0, 0.2, 0.0],      # 20 cm off in y
-    [0.0, 0.0, 0.3],      # right spot, but turned about 17 degrees
-    [0.8, -0.4, 1.5],     # way off
+    [0.0, 0.0, 0.0],		# the true pose
+    [0.2, 0.0, 0.0],		# 20 cm off in x
+    [0.0, 0.2, 0.0],		# 20 cm off in y
+    [0.0, 0.0, 0.3],		# right spot, turned about 17 degrees
+    [0.8, -0.4, 1.5],		# way off
 ])
 
 
 def score(pf, particles, r, theta):
-    """ puts the given particles in the filter, runs the laser update, and returns their weights.
-        beams that came back as inf (didn't hit anything) are dropped first, like run_loop does. """
+    """Puts particles in the filter, runs the laser update, and returns their weights.
+
+    Beams that came back as inf (no hit) are dropped first, like the range check in run_loop.
+
+    Args:
+        pf (particle_filter.ParticleFilter): Filter to score with.
+        particles (array-like): M x 3 [x (m), y (m), theta (rad)] particles.
+        r (np.ndarray): Beam ranges [m].
+        theta (np.ndarray): Beam angles relative to the robot [rad].
+
+    Returns:
+        np.ndarray: Length M normalized weights.
+    """
     keep = np.isfinite(r)
     pf.particle_cloud = np.array(particles, dtype=float)
     pf.particle_weights = np.ones(len(particles)) / len(particles)
@@ -36,21 +49,24 @@ def score(pf, particles, r, theta):
 
 
 def test_true_pose_scores_best(pf, simulate_scan):
-    # this is the main laser test. we make the scan the robot would see from the true pose, and the
-    # particle sitting at the true pose should get the most weight
+    """Checks that the particle at the true pose gets the most weight from a scan taken there.
+
+    This is the main laser test. Before walls were scaled by their median, a thin wall scored much
+    lower than a thick one, and a pose 20 cm off could beat the true pose here.
+    """
     r = simulate_scan(pf, true_pose, theta)
     weights = score(pf, true_pose + offsets, r, theta)
 
     assert np.argmax(weights) == 0
-    # the weights get normalized at the end of the update, so they should add up to 1.
-    # pytest.approx allows for tiny rounding errors.
     assert np.sum(weights) == pytest.approx(1.0)
 
 
 def test_a_few_bad_beams_dont_change_the_winner(pf, simulate_scan):
-    # in real life some beams hit things that aren't on the map, like people or chairs. here 27 of the
-    # 180 beams (15%) are cut short at 0.3 m as if something was standing next to the robot. thanks to
-    # min_likelihood, a few bad beams only cost a particle a little, so the true pose should still win.
+    """Checks that the true pose still wins when 15% of beams hit something not on the map.
+
+    27 of the 180 beams are cut short at 0.3 m, like a person standing next to the robot. Since
+    every beam gets at least min_likelihood, a few bad beams only cost a particle a little.
+    """
     r = simulate_scan(pf, true_pose, theta)
     blocked = np.random.choice(len(r), size=27, replace=False)
     r[blocked] = 0.3
@@ -59,8 +75,10 @@ def test_a_few_bad_beams_dont_change_the_winner(pf, simulate_scan):
 
 
 def test_beams_off_the_map_dont_break_anything(pf, simulate_scan):
-    # the second particle is 10 m outside the map, so all of its beams land off the map. those should just
-    # count as min_likelihood. we're making sure nothing crashes and no weights come out as nan.
+    """Checks that a particle 10 m off the map scores without crashing or giving nan weights.
+
+    All its beams land off the map, so they should only count as min_likelihood.
+    """
     r = simulate_scan(pf, true_pose, theta)
     weights = score(pf, [true_pose, [10.0, 10.0, 0.0]], r, theta)
 
@@ -69,9 +87,11 @@ def test_beams_off_the_map_dont_break_anything(pf, simulate_scan):
 
 
 def test_laser_offset_is_used(make_pf, simulate_scan):
-    # the neato's laser is 8.4 cm behind the center of the robot. the fake scan is taken from the laser's
-    # spot, so if update_particles_with_laser forgot about the offset, the scan would line up best with a
-    # robot sitting where the laser is. with the offset handled, the real center should win.
+    """Checks that laser_offset is applied, using the neato's laser 8.4 cm behind the robot's center.
+
+    The fake scan is taken from the laser's position. If the offset were ignored, the scan would
+    line up best with a robot sitting where the laser is instead of at the real center.
+    """
     pf = make_pf()
     pf.laser_offset = (-0.084, 0.0)
     r = simulate_scan(pf, true_pose, theta)
@@ -83,50 +103,53 @@ def test_laser_offset_is_used(make_pf, simulate_scan):
 
 
 def read_first_scan():
-    """ reads the ranges of the first scan saved in data.txt. that file is a copy of `ros2 topic echo /scan`
-        output: each scan has a "ranges:" line followed by one "- value" line per beam. """
+    """Reads the ranges of the first scan saved in data.txt.
+
+    data.txt is saved output of ros2 topic echo /scan, where each scan has a "ranges:" line
+    followed by one "- value" line per beam.
+
+    Returns:
+        np.ndarray: Ranges of the first scan [m], with inf where a beam hit nothing.
+    """
     ranges = []
     reading = False
     for line in open(Path(__file__).parent.parent / "robot_localization" / "data.txt"):
         if line.startswith("ranges:"):
             reading = True
         elif reading and line.startswith("- "):
-            # the echo writes infinity as ".inf", but python's float() only understands "inf"
+            # echo writes infinity as ".inf" but float() needs "inf"
             ranges.append(float(line[2:].replace(".inf", "inf")))
         elif reading:
-            break   # the first line that isn't a range means the first scan is over
+            break		# first non-range line ends the first scan
     return np.array(ranges)
 
 
 def test_real_scan_from_the_gauntlet(make_pf, gauntlet_map):
-    # everything above uses fake scans. this one uses a real scan we recorded in the gauntlet sim with the
-    # neato sitting at (0, 0) facing +x, scored on the real gauntlet map.
+    """Checks a real scan from the gauntlet sim, taken with the neato at (0, 0) facing +x.
+
+    The real pose has to beat the same spot turned sideways or backwards and spots 1 m away. It
+    isnt compared against poses only a few cm off, since the gauntlet map is a little smaller than
+    the sim world and the best fit ends up about 0.2 m from (0, 0). If the backwards-facing laser
+    were handled wrong, the pose turned 180 degrees would win.
+    """
     r = read_first_scan()
 
-    # beam angles from the scan's header: angle_min is -pi and they're 1 degree apart. the neato's laser
-    # is mounted facing backwards, so we add pi to every angle, the same thing
-    # convert_scan_to_polar_in_robot_frame does when the filter runs.
-    # the math here is given in the scan documenation w/ index * step
+    # angle_min and angle_increment from the scan header. the neato's laser faces backwards, so
+    # pi is added, same as convert_scan_to_polar_in_robot_frame does when the filter runs
     angles = -3.141590118408203 + np.arange(len(r)) * 0.017453277483582497 + math.pi
-    # keep only the readings inside the laser's valid range (0.1 to 5 m)
-    good = (r >= 0.1) & (r < 5.0)
+    good = (r >= 0.1) & (r < 5.0)		# laser's valid range [m]
 
-    # the right pose against the same spot turned sideways or backwards, and spots a meter away. we don't
-    # compare against poses only a few cm away, since we found the gauntlet map is a little smaller than
-    # the sim world, so the best fit is about 0.2 m off from (0, 0). if the backwards-facing laser were
-    # handled wrong, the pose turned by 180 degrees would win this.
     guesses = [
-        [0.0, 0.0, 0.0],            # where the robot really was
-        [0.0, 0.0, math.pi / 2],    # same spot, turned left
-        [0.0, 0.0, math.pi],        # same spot, facing backwards
-        [0.0, 0.0, -math.pi / 2],   # same spot, turned right
-        [1.0, 0.0, 0.0],            # a meter ahead
-        [-1.0, 0.0, 0.0],           # a meter behind
-        [0.0, -1.0, 0.0],           # a meter to the right
+        [0.0, 0.0, 0.0],		# where the robot really was
+        [0.0, 0.0, math.pi / 2],		# same spot, turned left
+        [0.0, 0.0, math.pi],		# same spot, facing backwards
+        [0.0, 0.0, -math.pi / 2],		# same spot, turned right
+        [1.0, 0.0, 0.0],		# 1 m ahead
+        [-1.0, 0.0, 0.0],		# 1 m behind
+        [0.0, -1.0, 0.0],		# 1 m to the right
     ]
-    # this test uses the sharper sigma_hit of 0.1 instead of our usual 0.2. the gauntlet is close to
-    # symmetric, and with the map being a bit too small, the blurrier 0.2 field can't tell facing forward
-    # from facing backwards at exactly (0, 0). 0.1 can, and the laser direction is what we're checking.
+    # sharper sigma_hit than the 0.2 m in conftest. the gauntlet is nearly symmetric and the map is a
+    # bit too small, so at 0.2 facing backwards wins at (0, 0). the laser direction is what this checks
     pf = make_pf(occupancy_field=gauntlet_map, sigma_hit=0.1)
     pf.laser_offset = (-0.084, 0.0)
     weights = score(pf, guesses, r[good], angles[good])
@@ -134,23 +157,24 @@ def test_real_scan_from_the_gauntlet(make_pf, gauntlet_map):
 
 
 def test_normalize_keeps_the_ratios(pf):
-    # the first particle has twice the weight of the others. after normalizing, the weights should add up
-    # to 1 and the first should still be twice the others.
+    """Checks that normalizing makes weights sum to 1 without changing their ratios."""
     pf.particle_cloud = np.zeros((3, 3))
     pf.particle_weights = np.array([2.0, 1.0, 1.0])
     pf.normalize_particles()
     np.testing.assert_allclose(pf.particle_weights, [0.5, 0.25, 0.25])
 
 
-# three kinds of broken weights: all zero (every particle scored 0), a nan, and an infinity
 @pytest.mark.parametrize("bad_weights", [
-    [0.0, 0.0, 0.0, 0.0],
+    [0.0, 0.0, 0.0, 0.0],		# every particle scored 0
     [np.nan, 1.0, 1.0, 1.0],
     [np.inf, 1.0, 1.0, 1.0],
 ])
 def test_normalize_falls_back_to_equal_weights(pf, bad_weights):
-    # dividing by the total doesn't work for these: dividing by 0 gives nan, and nan or inf just spreads
-    # to every weight. we can't trust any of them, so normalize should make them all equal instead.
+    """Checks that weights that cant be normalized are reset to equal.
+
+    Dividing by a total of 0 gives nan, and a nan or inf spreads to every weight, so none of them
+    can be trusted.
+    """
     pf.particle_cloud = np.zeros((4, 3))
     pf.particle_weights = np.array(bad_weights)
     pf.normalize_particles()
@@ -158,22 +182,22 @@ def test_normalize_falls_back_to_equal_weights(pf, bad_weights):
 
 
 def test_resample_keeps_the_shape_and_resets_the_weights(pf):
+    """Checks that resampling returns n_particles particles that all start with equal weight."""
     pf.particle_cloud = np.array([pf.random_particle() for _ in range(pf.n_particles)])
     pf.particle_weights = np.random.random(pf.n_particles)
     pf.resample_particles()
 
-    # we should get the same number of particles back
     assert pf.particle_cloud.shape == (pf.n_particles, 3)
-    # and the new particles should all start out equal. the next laser update gives them new weights.
     np.testing.assert_allclose(pf.particle_weights, 1 / pf.n_particles)
 
 
 def test_one_heavy_particle_takes_over(make_pf):
-    # particle 7 has all the weight and the rest have none, so every new particle should be a copy of
-    # particle 7. each copy gets moved a little at random (resample_xy_sigma, 0.1 m), so they won't sit
-    # exactly on it. we check they're all within 0.5 m, five times that spread. that's loose enough that
-    # random noise won't fail it, but way tighter than the original particles, which were spread over
-    # the whole room.
+    """Checks that when one particle has all the weight, every new particle is a copy of it.
+
+    Each copy is moved by resample_xy_sigma (0.1 m), so they should all be within 0.5 m of it.
+    That's loose enough that noise wont fail the test, but far tighter than the original cloud,
+    which was spread over the whole room.
+    """
     pf = make_pf(random_resample=0.0)
     pf.particle_cloud = np.array([pf.random_particle() for _ in range(pf.n_particles)])
     pf.particle_weights = np.zeros(pf.n_particles)
@@ -186,23 +210,24 @@ def test_one_heavy_particle_takes_over(make_pf):
 
 
 def test_particles_are_picked_in_proportion_to_their_weight(make_pf):
-    # three spots 1 m apart. spot a (one particle) gets 50% of the weight, spot b (one particle) gets 30%,
-    # and spot c has all the other 2998 particles sharing the last 20%. after resampling, about half the
-    # particles should be at a, about 30% at b, and about 20% at c. we use 3000 particles so random luck
-    # doesn't move those numbers much, and allow 3% either way.
+    """Checks that each spot gets a share of the new particles matching its share of the weight.
+
+    Spot a (one particle) has 50% of the weight, spot b (one particle) has 30%, and spot c (the
+    other 2998 particles) shares the last 20%. 3000 particles keeps random luck small enough to
+    allow only 3% either way.
+    """
     n = 3000
     pf = make_pf(n_particles=n, random_resample=0.0)
     pf.particle_cloud = np.zeros((n, 3))
-    pf.particle_cloud[0] = [-1.0, 0.0, 0.0]     # spot a
-    pf.particle_cloud[1] = [0.0, 0.0, 0.0]      # spot b
-    pf.particle_cloud[2:] = [1.0, 0.5, 0.0]     # spot c
+    pf.particle_cloud[0] = [-1.0, 0.0, 0.0]		# spot a
+    pf.particle_cloud[1] = [0.0, 0.0, 0.0]		# spot b
+    pf.particle_cloud[2:] = [1.0, 0.5, 0.0]		# spot c
     pf.particle_weights = np.full(n, 0.2 / (n - 2))
     pf.particle_weights[0] = 0.5
     pf.particle_weights[1] = 0.3
     pf.resample_particles()
 
-    # count how many new particles ended up near each spot. np.mean of a list of True/False gives the
-    # fraction that are True.
+    # mean of a boolean array is the fraction that are True
     x = pf.particle_cloud[:, 0]
     assert np.mean(np.abs(x + 1.0) < 0.3) == pytest.approx(0.5, abs=0.03)
     assert np.mean(np.abs(x) < 0.3) == pytest.approx(0.3, abs=0.03)
