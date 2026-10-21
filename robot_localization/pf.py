@@ -150,7 +150,7 @@ class ParticleFilter(Node):
         self.transform_update_timer = self.create_timer(0.05, self.pub_latest_transform)		# 0.05 s period = 20 Hz
 
         # old testing/visualization code
-        # self.initialize_particle_cloud()
+        #self.initialize_particle_cloud()
         # self.particle_weights = np.zeros([self.n_particles, 1])
         # self.particle_weights[10:13, 0] = 0.1
         # self.particle_weights[0, 0] = 0.7
@@ -454,13 +454,15 @@ class ParticleFilter(Node):
             self.particle_cloud = self.normal_particles(np.tile(xy_theta, (self.n_particles, 1)))
 
         # visualization code with copy() added so we dont modify original map_array
-        # particle_map = self.occupancy_field.map_array.copy()
-        # for i in range(self.n_particles):
-        #     ix, iy, on_map = self.world_to_cell(self.particle_cloud[i, 0], self.particle_cloud[i, 1])
-        #     if on_map:
-        #         particle_map[iy, ix] = 200
-        # plt.imshow(particle_map, interpolation='nearest')
-        # plt.show()
+        print("hi")
+        particle_map = self.occupancy_field.map_array.copy()
+        for i in range(self.n_particles):
+            ix, iy, on_map = self.world_to_cell(self.particle_cloud[i, 0], self.particle_cloud[i, 1])
+            if on_map:
+                particle_map[iy, ix] = 200
+        plt.imshow(particle_map, interpolation='nearest')
+        plt.show()
+        print("hi")
 
         self.particle_weights = np.ones(self.n_particles)
 
