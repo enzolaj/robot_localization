@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 
-""" This is the starter code for the robot localization project """
-from matplotlib import pyplot as plt
+"""Monte Carlo Localization particle filter node for a known occupancy grid map."""
+from matplotlib import pyplot as plt		# noqa: F401, only used by the commented-out visualization in initialize_particle_cloud
 import rclpy
 from threading import Thread
 from rclpy.time import Time
 from rclpy.node import Node
-from std_msgs.msg import Header
 from sensor_msgs.msg import LaserScan
-from nav2_msgs.msg import ParticleCloud, Particle
+from nav2_msgs.msg import ParticleCloud
 from nav2_msgs.msg import Particle as Nav2Particle
 from geometry_msgs.msg import PoseWithCovarianceStamped, Pose, Point, Quaternion
 from rclpy.duration import Duration
@@ -20,6 +19,7 @@ from helper_functions import TFHelper
 from rclpy.qos import qos_profile_sensor_data
 from angle_helpers import quaternion_from_euler
 from scipy.ndimage import gaussian_filter		# blurs map walls into likelihood field
+
 
 class Particle(object):
     """ Represents a hypothesis (particle) of the robot's pose consisting of x,y and theta (yaw)
@@ -56,6 +56,7 @@ class Particle(object):
 
     # particle_cloud is kept as one N x 3 numpy array so math is fast.
     # this class is just used to wrap a single row into a Pose msg when publishing to rviz
+
 
 class ParticleFilter(Node):
     """ The class that represents a Particle Filter ROS Node
@@ -96,7 +97,7 @@ class ParticleFilter(Node):
 
         # motion thresholds before triggering a filter update
         self.d_thresh = self.declare_parameter("d_thresh", 0.05).value		# linear movement threshold [m]
-        self.a_thresh = self.declare_parameter("a_thresh", math.pi/24).value		# angular movement threshold [rad]
+        self.a_thresh = self.declare_parameter("a_thresh", math.pi / 24).value		# angular movement threshold [rad]
 
         # resampling params, keep a fraction random to prevent particle degeneracy
         # and use smaller spread than init since resampled particles already scored well
@@ -150,7 +151,7 @@ class ParticleFilter(Node):
         self.transform_update_timer = self.create_timer(0.05, self.pub_latest_transform)		# 0.05 s period = 20 Hz
 
         # old testing/visualization code
-        #self.initialize_particle_cloud()
+        # self.initialize_particle_cloud()
         # self.particle_weights = np.zeros([self.n_particles, 1])
         # self.particle_weights[10:13, 0] = 0.1
         # self.particle_weights[0, 0] = 0.7
@@ -168,7 +169,7 @@ class ParticleFilter(Node):
         self.transform_helper.send_last_map_to_odom_transform(self.map_frame, self.odom_frame, postdated_timestamp)
 
     def loop_wrapper(self):
-        """Calls run_loop repeatedly at ~10 Hz on the background thread.
+        """Calls run_loop repeatedly, sleeping 0.01 s between calls, on the background thread.
 
         Using a separate thread works around single-threaded bottlenecks in ROS2
         so slower filter updates do not block incoming sensor callbacks.
@@ -254,10 +255,9 @@ class ParticleFilter(Node):
         Returns:
             bool: True if linear change > d_thresh or angular change > a_thresh.
         """
-        return math.fabs(new_odom_xy_theta[0] - self.current_odom_xy_theta[0]) > self.d_thresh or \
-               math.fabs(new_odom_xy_theta[1] - self.current_odom_xy_theta[1]) > self.d_thresh or \
-               math.fabs(self.transform_helper.angle_diff(new_odom_xy_theta[2], self.current_odom_xy_theta[2])) > self.a_thresh
-
+        return (math.fabs(new_odom_xy_theta[0] - self.current_odom_xy_theta[0]) > self.d_thresh
+                or math.fabs(new_odom_xy_theta[1] - self.current_odom_xy_theta[1]) > self.d_thresh
+                or math.fabs(self.transform_helper.angle_diff(new_odom_xy_theta[2], self.current_odom_xy_theta[2])) > self.a_thresh)
 
     def update_robot_pose(self):
         """Updates self.robot_pose and recalculates the map -> odom transform.
@@ -454,15 +454,13 @@ class ParticleFilter(Node):
             self.particle_cloud = self.normal_particles(np.tile(xy_theta, (self.n_particles, 1)))
 
         # visualization code with copy() added so we dont modify original map_array
-        #print("We are reaching this point.")
-        #particle_map = self.occupancy_field.map_array.copy()
-        #for i in range(self.n_particles):
-        #    ix, iy, on_map = self.world_to_cell(self.particle_cloud[i, 0], self.particle_cloud[i, 1])
-        #    if on_map:
-        #        particle_map[iy, ix] = 200
-        #plt.imshow(particle_map, interpolation='nearest')
-        #plt.show()
-        #print("We are reaching this second point.")
+        # particle_map = self.occupancy_field.map_array.copy()
+        # for i in range(self.n_particles):
+        #     ix, iy, on_map = self.world_to_cell(self.particle_cloud[i, 0], self.particle_cloud[i, 1])
+        #     if on_map:
+        #         particle_map[iy, ix] = 200
+        # plt.imshow(particle_map, interpolation='nearest')
+        # plt.show()
 
         self.particle_weights = np.ones(self.n_particles)
 
@@ -506,7 +504,6 @@ class ParticleFilter(Node):
         theta = centers[:, 2] + np.random.normal(0, theta_sigma, m)		# [rad]
         particles[:, 2] = np.arctan2(np.sin(theta), np.cos(theta))
         return particles
-
 
     def normalize_particles(self):
         """Normalizes particle_weights so all weights sum to 1.0.
@@ -582,7 +579,7 @@ class ParticleFilter(Node):
         # (for edge pixels) as 0
         walls = (grid > 0).astype(float)
         blurred = gaussian_filter(walls, self.sigma_hit / self.map_resolution, mode="constant")
-        # scale so highest value on walls is 1.0 to match our probabilities scaling
+        # scale so a typical (median) wall cell is 1.0 and cap thicker walls at 1.0 to match our probability scaling
         self.likelihood_field = np.minimum(blurred / np.median(blurred[walls > 0]), 1.0)
 
         # every free cell's (iy, ix) indices, found once here so random_particles can pick from them directly
@@ -701,12 +698,14 @@ class ParticleFilter(Node):
 
         return (avg_x, avg_y, avg_theta)
 
+
 def main(args=None):
     """Initializes ROS2, spins the ParticleFilter node, and shuts down on exit."""
     rclpy.init()
     n = ParticleFilter()
     rclpy.spin(n)
     rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
