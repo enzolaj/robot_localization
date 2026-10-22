@@ -3,9 +3,10 @@
 <package format="3">
   <name>robot_localization</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
-  <maintainer email="paullundyruvolo@gmail.com">pruvolo</maintainer>
-  <license>TODO: License declaration</license>
+  <description> This package contains a robot localization filter using Monte Carlo Localization - a particle filter that estimates the robot's pose on a known map. </description>
+  <maintainer email="esmajlaj@olin.edu">Enzo S.</maintainer>
+  <maintainer email="lbrennan@olin.edu">Liam B.</maintainer>
+  <license>All rights reserved :)</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
 
