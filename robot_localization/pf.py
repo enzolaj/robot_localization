@@ -454,15 +454,15 @@ class ParticleFilter(Node):
             self.particle_cloud = self.normal_particles(np.tile(xy_theta, (self.n_particles, 1)))
 
         # visualization code with copy() added so we dont modify original map_array
-        print("hi")
-        particle_map = self.occupancy_field.map_array.copy()
-        for i in range(self.n_particles):
-            ix, iy, on_map = self.world_to_cell(self.particle_cloud[i, 0], self.particle_cloud[i, 1])
-            if on_map:
-                particle_map[iy, ix] = 200
-        plt.imshow(particle_map, interpolation='nearest')
-        plt.show()
-        print("hi")
+        #print("We are reaching this point.")
+        #particle_map = self.occupancy_field.map_array.copy()
+        #for i in range(self.n_particles):
+        #    ix, iy, on_map = self.world_to_cell(self.particle_cloud[i, 0], self.particle_cloud[i, 1])
+        #    if on_map:
+        #        particle_map[iy, ix] = 200
+        #plt.imshow(particle_map, interpolation='nearest')
+        #plt.show()
+        #print("We are reaching this second point.")
 
         self.particle_weights = np.ones(self.n_particles)
 
