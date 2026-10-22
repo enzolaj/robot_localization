@@ -103,7 +103,7 @@ Table 2 below lists every ROS2 parameter declared in `__init__()`, its function,
 | `cluster_radius`                            | 1.0 m                | Radius around the best particle within which particles are averaged into the pose estimate                                                        | About ten times `resample_xy_sigma`, so a converged cluster fits inside it while a second group in another similar area will not. Most areas of the map were not similar within this radius, so it could still include additional nearby particles.                                     |
 
 
-Many of these values have a particular interplay with other functionality of the system - for example, modifying `random_resample` translates to a modification in many of the standard deviations of other distributions and the total particle count. With `random_resample` at 0.2, every update places 1200 of the 6000 particles at random over roughly 1371 $m^2$ of free space, a density of only about 0.9 particles per $m^2$. Once the filter has localized, almost none of these land near the robot, so in practice roughly 4800 particles perform the tracking. 
+Many of these values have a particular interplay with other functionality of the system - for example, modifying `random_resample` translates to a modification in many of the standard deviations of other distributions and the total particle count. With `random_resample` at 0.2, every update places 1200 of the 6000 particles at random over roughly 1371 m$^2$ of free space, a density of only about 0.9 particles per m$^2$. Once the filter has localized, almost none of these land near the robot, so in practice roughly 4800 particles perform the tracking. 
 
 #### 1.2.3 Course-Provided Helpers
 
@@ -129,7 +129,7 @@ Table 3 lists the two bags we used.
 | [`macfirst_floor_take_1`](bags/macfirst_floor_take_1) | ~93 s | `/scan` (~7.7 Hz, 720 beams), `/tf` (~20 Hz), `/tf_static`, `/odom`, `/cmd_vel` | A lag spike at ~58.9 s appears in every run, indicating it originates in the bag |
 | [`macfirst_floor_take_2`](bags/macfirst_floor_take_2) | ~46 s | same as take 1 | The robot is stationary for the first ~11 s |
 
-The map, [`maps/mac_1st_floor_final.yaml`](maps/mac_1st_floor_final.yaml), has a resolution of 0.03 m per cell and approximately 1371 $m^2$ of free space. Consequently, the resulting particle density is low for our selected 6000 particles, amounting to only about 4.4 per $m^2$, which is a large component of the difficulty of global localization from a random cloud (Section 2.1.2). Unknown (gray) cells are treated as empty when building the likelihood field, so any surface the lidar detects in an unmapped region scores the same as open space. Though the map was developed via SLAM tools on an earlier run inside that same bag recording, there still exist tiny scaling differences in the way that the points are interpreted during SLAM to convert to the map. For example, areas that are explored more densely lead to thinner walls as more points exist there and can cleanly extract some depth, similar to the irregular thickness of obstacle walls on the Neato Gauntlet World. Thus, the scan may not line up exactly with the map data, though in our testing this was negligible in delivering a solid pose extraction algorithm.
+The map, [`maps/mac_1st_floor_final.yaml`](maps/mac_1st_floor_final.yaml), has a resolution of 0.03 m per cell and approximately 1371 m$^2$ of free space. Consequently, the resulting particle density is low for our selected 6000 particles, amounting to only about 4.4 per m$^2$, which is a large component of the difficulty of global localization from a random cloud (Section 2.1.2). Unknown (gray) cells are treated as empty when building the likelihood field, so any surface the lidar detects in an unmapped region scores the same as open space. Though the map was developed via SLAM tools on an earlier run inside that same bag recording, there still exist tiny scaling differences in the way that the points are interpreted during SLAM to convert to the map. For example, areas that are explored more densely lead to thinner walls as more points exist there and can cleanly extract some depth, similar to the irregular thickness of obstacle walls on the Neato Gauntlet World. Thus, the scan may not line up exactly with the map data, though in our testing this was negligible in delivering a solid pose extraction algorithm.
 
 [`bags/README.md`](bags/README.md) describes each bag in more detail, along with three output bags recorded while our filter ran on them and how to replay them.
 
@@ -188,10 +188,14 @@ First, if there is no initial estimate for the robot's position, the particle cl
 
 The guess comes from RViz's 2D Pose Estimate tool. <a id="pf-update_initial_pose"></a>`update_initial_pose()` receives the clicked pose, converts it to (x, y, θ), passes it to `initialize_particle_cloud()`, and publishes the new cloud right away instead of waiting for the robot to move. In both cases, `initialize_particle_cloud()` then gives every particle equal weight and resets the odometry baseline to the robot's current pose, so motion from before the reset is not applied to the new cloud.
 
-When the particle cloud is initialized around a best guess for the robot's position, there is only one point around which the particles are generated, as opposed to the many during resampling. Because of this, a larger standard deviation is used for the inital guess (`init_xy_sigma`, `init_theta_sigma`) than for the resampling (`resample_xy_sigma`, `resample_theta_sigma`).
+When the particle cloud is initialized around a best guess for the robots position, there is only one point around which the particle is generated as opposed to the many during resampling, because of this a larger standard deviation is used for the initial guess (`init_xy_sigma`, `init_theta_sigma`) than for the resampling (`resample_xy_sigma`, `resample_theta_sigma`).
 
-[TODO: talk more about this section]
-[TODO: include a table that shows how the distribution would matter in map scale prob]
+
+Additionally, we noticed that because we don't scale our particle count with the size of the map, smaller maps have a much higher particle density than large ones. While this did not significantly hinder our particle filter, it could definitely be an issue with much larger maps. As seen below in Figure 4, the particle distribution varies a lot depending on the size of the map.
+
+| Particle initialization in the MAC (about 1371 $m^2$ of free space) | Particle initialization in the Gauntlet World (about 12 $m^2$ of free space) |
+| :---: | :---: |
+| ![6000 random particles in the MAC](docs/MAC_particle_initialize_example.png)<br><em>Figure 4a: 6000 particles randomly placed around the MAC</em> | ![6000 random particles in the Gauntlet World](docs/Gazebo_particle_initialize_example.png)<br><em>Figure 4b: 6000 particles randomly placed around the Gauntlet World</em> |
 
 #### 2.1.3 Testing
 
@@ -367,11 +371,11 @@ $$
 
 where $T_{\text{map}\to\text{robot}}$ is the filter's pose estimate and $T_{\text{odom}\to\text{robot}}$ is the odometry pose.
 
-For example, in <a id="test_robot_pose_becomes_the_map_to_odom_transform"></a>`test_robot_pose_becomes_the_map_to_odom_transform`, odometry reports the robot at (1, 0) facing +x, while the particles place it at (3, 2) facing +y. The odom frame must therefore be rotated 90 degrees on the map, and since the robot is 1 m along odom's x-axis, which now points in +y on the map, the odom origin sits 1 m below the robot, at (3, 1), as shown in Figure 4. This arrangement is also why the robot moves smoothly in RViz between filter updates (when viewing the robot model on top of the particle cluster): the `map` to `odom` transform only changes when the filter updates, while odometry continues to update at about 20 Hz.
+For example, in <a id="test_robot_pose_becomes_the_map_to_odom_transform"></a>`test_robot_pose_becomes_the_map_to_odom_transform`, odometry reports the robot at (1, 0) facing +x, while the particles place it at (3, 2) facing +y. The odom frame must therefore be rotated 90 degrees on the map, and since the robot is 1 m along odom's x-axis, which now points in +y on the map, the odom origin sits 1 m below the robot, at (3, 1), as shown in Figure 5. This arrangement is also why the robot moves smoothly in RViz between filter updates (when viewing the robot model on top of the particle cluster): the `map` to `odom` transform only changes when the filter updates, while odometry continues to update at about 20 Hz.
 
 Two limitations apply here. Because `cluster_radius` is fixed, part of the cloud is left out of the average right after initialization, when the cloud is wider than 1 m, and since the node publishes no covariance, downstream nodes cannot tell a confident estimate from an uncertain one.
 
-<p align="center"> <img src="docs/map_odom.png" alt="map, odom, and robot frames"> </p> <p align="center"><em>Figure 4: The worked example above. Odometry places the robot 1 m along odom's x axis, so for the robot to sit at (3, 2) facing +y on the map, the odom frame must sit at (3, 1), rotated 90 degrees.</em></p>
+<p align="center"> <img src="docs/map_odom.png" alt="map, odom, and robot frames"> </p> <p align="center"><em>Figure 5: The worked example above. Odometry places the robot 1 m along odom's x axis, so for the robot to sit at (3, 2) facing +y on the map, the odom frame must sit at (3, 1), rotated 90 degrees.</em></p>
 
 
 ### <a name="resampling" id="resampling"></a>2.5 Particle Resampling
@@ -388,23 +392,23 @@ Then we concatenate the two arrays of particles, the randomly placed and weighte
 
 Three tests check resampling. <a id="test_resample_keeps_the_shape_and_resets_the_weights"></a>`test_resample_keeps_the_shape_and_resets_the_weights` checks that the new cloud has `n_particles` rows and equal weights. With random particles turned off, <a id="test_one_heavy_particle_takes_over"></a>`test_one_heavy_particle_takes_over` gives one particle all of the weight and checks that every new particle lands within 0.5 m of it, and <a id="test_particles_are_picked_in_proportion_to_their_weight"></a>`test_particles_are_picked_in_proportion_to_their_weight` splits the weight 50%, 30%, and 20% between three spots and checks that each spot receives that share of the new cloud, within 3%.
 
-[TODO: liam part]
+The main limitation of our particle placement for both weighted and randomly placed particles is the fact that we have no way to distinguish between inside a wall and outside a wall as the maps only have the surface of the walls marked as occupied. Because of this, both initial particles and weighted particles can be placed behind walls, which both wastes processing power and creates the small likelihood that the robot estimates its pose as inside a wall, which could have disastrous effects on a real robot.
 
 ## 3. System Integration, Performance, & Results
 
 ### 3.1 End-to-End Flow of run_loop
 
-The entire process of our filter occurs in <a id="pf-run_loop"></a>`run_loop()`. Each pass of `run_loop()` first checks whether a scan is waiting in `scan_to_process`. If one is, `get_matching_odom_pose()` asks TF for the robot's odometry pose at the exact time the scan was taken. If that transform is not available yet, `run_loop()` returns and tries again on the next pass, and if the scan is older than everything in the TF buffer, it can never be matched and is dropped. Once matched, the scan is converted to polar coordinates in the robot's frame and subsampled. What happens next depends on the state of the filter: the first scan sets the odometry baseline, the second creates the particle cloud, and every scan after that triggers a full update whenever the robot has moved far enough. This process is visualized below in Figure 5:
+The entire process of our filter occurs in <a id="pf-run_loop"></a>`run_loop()`. Each pass of `run_loop()` first checks whether a scan is waiting in `scan_to_process`. If one is, `get_matching_odom_pose()` asks TF for the robot's odometry pose at the exact time the scan was taken. If that transform is not available yet, `run_loop()` returns and tries again on the next pass, and if the scan is older than everything in the TF buffer, it can never be matched and is dropped. Once matched, the scan is converted to polar coordinates in the robot's frame and subsampled. What happens next depends on the state of the filter: the first scan sets the odometry baseline, the second creates the particle cloud, and every scan after that triggers a full update whenever the robot has moved far enough. This process is visualized below in Figure 6:
 
 ```
 update_particles_with_odom()  ->  update_particles_with_laser()  ->  update_robot_pose()  ->  resample_particles()  ->  publish_particles()
 ```
 
-<p align="center"> <img src="docs/run_loop.png" alt="run_loop flowchart"> </p> <p align="center"><em>Figure 5: One pass of run_loop. Lag is logged for every scan that gets processed, and every pass returns to loop_wrapper, which sleeps 0.01 s before the next one.</em></p>
+<p align="center"> <img src="docs/run_loop.png" alt="run_loop flowchart"> </p> <p align="center"><em>Figure 6: One pass of run_loop. Lag is logged for every scan that gets processed, and every pass returns to loop_wrapper, which sleeps 0.01 s before the next one.</em></p>
 
 ### 3.2 Measuring and Reducing Lag
 
-We define lag as the current bag time minus the timestamp of the scan being processed and log it at the debug level for every scan. Our target was about 0.13 s, or one scan period at 7.7 Hz (Section 1.2.2), which would imply that every scan was being read. To find where the time went, we also logged how old each scan was when it arrived, how long the filter update took, and how long publishing took; all of these are written to `~/.ros/log` when the node runs with `--log-level pf:=debug`. The update and publish times come from `time.perf_counter()`, which measures wall time, so they can only be compared directly to lag, which is measured in bag time, when the bag plays at `--rate 1`. The median lag is showcased below in Table 6, and Figure 6 plots the lag over time.
+We define lag as the current bag time minus the timestamp of the scan being processed and log it at the debug level for every scan. Our target was about 0.13 s, or one scan period at 7.7 Hz (Section 1.2.2), which would imply that every scan was being read. To find where the time went, we also logged how old each scan was when it arrived, how long the filter update took, and how long publishing took; all of these are written to `~/.ros/log` when the node runs with `--log-level pf:=debug`. The update and publish times come from `time.perf_counter()`, which measures wall time, so they can only be compared directly to lag, which is measured in bag time, when the bag plays at `--rate 1`. The median lag is showcased below in Table 6, and Figure 7 plots the lag over time.
 
 *Table 6: Median lag over the first 14 s of take 1 as we changed the code.*
 
@@ -422,7 +426,7 @@ The logs also showed a few odd patterns. First, a lag spike occurred at about 58
 
 Because `--symlink-install` runs `pf.py` exactly as saved, several of our log files also had no record of which code version produced them; logging the parameters and git commit at startup would have avoided this.
 
-<p align="center"> <img src="docs/lag.png" alt="Lag over time"> </p> <p align="center"><em>Figure 6: Lag on take 1 from the node's debug logs. Top: the first 14 s of each code version in Table 6. Bottom: the whole bag for the first and last versions, which both show the spike at about 59 s.</em></p>
+<p align="center"> <img src="docs/lag.png" alt="Lag over time"> </p> <p align="center"><em>Figure 7: Lag on take 1 from the node's debug logs. Top: the first 14 s of each code version in Table 6. Bottom: the whole bag for the first and last versions, which both show the spike at about 59 s.</em></p>
 
 ### 3.3 Vectorization
 
@@ -438,25 +442,25 @@ We used the ROS logger instead of print statements. The node logs at `info` leve
 - **scan arrived**: How old is a scan before the filter touches it?
 - **lag**: Is the filter keeping up with the laser?
 
-RViz was our other main tool for visualization. Since we could see all of our particles as well as the casted scan onto our estimation, we could determine the efficacy of our filter by comparing the casted scan with the walls given to us by the map. The more these align, the better the filter, and if the particles are in open space, we can tell something is off. We also used `view_likelihood_field.py` to inspect the likelihood field directly, and the commented-out matplotlib code in `initialize_particle_cloud()` plots the starting particles on the map. Below is Figure 7, visualizing what the RViz viewer showcases before the filter has localized, or essentially amidst the process of determining an accurate location.
+RViz was our other main tool for visualization. Since we could see all of our particles as well as the casted scan onto our estimation, we could determine the efficacy of our filter by comparing the casted scan with the walls given to us by the map. The more these align, the better the filter, and if the particles are in open space, we can tell something is off. We also used `view_likelihood_field.py` to inspect the likelihood field directly, and the commented-out matplotlib code in `initialize_particle_cloud()` plots the starting particles on the map. Below is Figure 8, visualizing what the RViz viewer showcases before the filter has localized, or essentially amidst the process of determining an accurate location.
 
-<p align="center"> <img src="docs/rviz_unlocalized.png" alt="RViz before localization"> </p> <p align="center"><em>Figure 7: RViz during bag playback before the filter has localized. Note the red scan points not lining up with the map's walls.</em></p>
+<p align="center"> <img src="docs/rviz_unlocalized.png" alt="RViz before localization"> </p> <p align="center"><em>Figure 8: RViz during bag playback before the filter has localized. Note the red scan points not lining up with the map's walls.</em></p>
 
 ### 3.5 Results & Demonstrations
 
 The GIFs below were recorded in RViz while the filter ran live on the bags with its default parameters, sped up 3× (2× for take 2). Green arrows are particles and red points are the laser scan drawn from the filter's estimated pose, so the filter has localized once the red points line up with the map's black walls. The output bags recorded during these runs are in [`bags/`](bags), described in [`bags/README.md`](bags/README.md).
 
-- **Global localization on take 1 (Figure 8).** The robot starts near the west end of the first hallway, drives about 5 m east, turns and drives roughly 12 m south down a second hallway, and then turns around and heads back north. Starting from particles spread over the whole map, the cloud first settles in the wrong room after about 9 s, jumps to a second wrong spot at about 18 s, and locks onto the correct pose by about 26 s, where it stays for the rest of the bag. Both wrong guesses are places whose walls match the scan reasonably well, and the filter can leave them because every resample spreads 20% of the particles randomly over the map (Section 2.5.1).
+- **Global localization on take 1 (Figure 9).** The robot starts near the west end of the first hallway, drives about 5 m east, turns and drives roughly 12 m south down a second hallway, and then turns around and heads back north. Starting from particles spread over the whole map, the cloud first settles in the wrong room after about 9 s, jumps to a second wrong spot at about 18 s, and locks onto the correct pose by about 26 s, where it stays for the rest of the bag. Both wrong guesses are places whose walls match the scan reasonably well, and the filter can leave them because every resample spreads 20% of the particles randomly over the map (Section 2.5.1).
 
-<p align="center"> <img src="docs/take1_random_start.gif" alt="Global localization on take 1"> </p> <p align="center"><em>Figure 8: Global localization on take 1 from particles spread over the whole map, at 3× speed.</em></p>
+<p align="center"> <img src="docs/take1_random_start.gif" alt="Global localization on take 1"> </p> <p align="center"><em>Figure 9: Global localization on take 1 from particles spread over the whole map, at 3× speed.</em></p>
 
-- **Starting from a 2D Pose Estimate (Figure 9).** With the cloud started around the robot's true starting pose, the scan lines up with the walls from the first update, and the filter tracks the robot for the entire bag.
+- **Starting from a 2D Pose Estimate (Figure 10).** With the cloud started around the robot's true starting pose, the scan lines up with the walls from the first update, and the filter tracks the robot for the entire bag.
 
-<p align="center"> <img src="docs/take1_pose_estimate.gif" alt="Tracking on take 1 from a 2D Pose Estimate"> </p> <p align="center"><em>Figure 9: Take 1 started from a 2D Pose Estimate at the robot's starting pose, at 3× speed.</em></p>
+<p align="center"> <img src="docs/take1_pose_estimate.gif" alt="Tracking on take 1 from a 2D Pose Estimate"> </p> <p align="center"><em>Figure 10: Take 1 started from a 2D Pose Estimate at the robot's starting pose, at 3× speed.</em></p>
 
-- **Take 2 (Figure 10).** The robot is stationary for the first ~11 s, so the cloud stays spread out until it moves, since the filter only updates once the robot passes `d_thresh` or `a_thresh` (Section 2.2.1). Within a few seconds of the robot starting to drive, the cloud converges to a single cluster in the hallway.
+- **Take 2 (Figure 11).** The robot is stationary for the first ~11 s, so the cloud stays spread out until it moves, since the filter only updates once the robot passes `d_thresh` or `a_thresh` (Section 2.2.1). Within a few seconds of the robot starting to drive, the cloud converges to a single cluster in the hallway.
 
-<p align="center"> <img src="docs/take2_random_start.gif" alt="Global localization on take 2"> </p> <p align="center"><em>Figure 10: Take 2 from particles spread over the whole map, at 2× speed. The cloud does not change until the robot starts moving.</em></p>
+<p align="center"> <img src="docs/take2_random_start.gif" alt="Global localization on take 2"> </p> <p align="center"><em>Figure 11: Take 2 from particles spread over the whole map, at 2× speed. The cloud does not change until the robot starts moving.</em></p>
 
 In every take 1 run, including the one started from the true pose, the scan fits the map noticeably worse between about 25 s and 40 s, with many red points landing in open space. Since this happens at the same place regardless of how the filter started, we assume that stretch of hallway contains objects that are not on the map rather than the filter losing track.
 
